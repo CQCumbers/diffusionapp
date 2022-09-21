@@ -2,3 +2,5 @@
 *.mlmodel
 merges.txt
 vocab.json
+ruins.png
+txt2img
