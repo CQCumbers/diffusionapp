@@ -212,7 +212,7 @@ void bpe_free(bpe_context_t ctx) {
     free(ctx);
 }
 
-int bpe_encode(bpe_context_t ctx, const char *text, int *ids, int capacity) {
+int bpe_encode(bpe_context_t ctx, const char *text, float *ids, int capacity) {
     /* initialize token list */
     token_t *list = ctx->list;
     short length = strlen(text), n_ids = 0;

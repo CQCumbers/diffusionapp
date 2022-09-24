@@ -1,6 +1,8 @@
 .DS_Store
 *.mlmodel
+*.mlmodelc
 merges.txt
 vocab.json
 ruins.png
+ruins_c.png
 txt2img

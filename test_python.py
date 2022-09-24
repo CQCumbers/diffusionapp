@@ -124,6 +124,7 @@ class TextEncoderWrapper:
         print("loading saved coreml model"); self.f = ct.models.MLModel(out_name, compute_units=ct.ComputeUnit.CPU_AND_GPU); print("loaded")
     
     def __call__(self, input):
+        print(f"Input ids: {input.float()}")
         args = args = {"input_ids_1": input.float().numpy()}
         for v in self.f.predict(args).values():
             return (th.tensor(v, dtype=th.float32),)
