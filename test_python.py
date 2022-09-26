@@ -10,6 +10,7 @@ import coremltools as ct
 from coremltools.models.neural_network import quantization_utils
 from pathlib import Path
 import torch as th
+import numpy as np
 import diffusers
 
 class Undictifier(th.nn.Module):
@@ -114,7 +115,11 @@ class UNetWrapper:
 
     def __call__(self, sample, timestep, encoder_hidden_states):
         args = {"sample_1": sample.numpy(), "timestep": th.tensor([timestep], dtype=th.int32).numpy(), "input_35": encoder_hidden_states.numpy()}
+        print(f'Calling with timestep {timestep}\n')
+        print(f'Calling with input_35 {encoder_hidden_states.numpy()}\n')
+        print(f'Calling with sample_1 {sample.numpy()}\n')
         for v in self.f.predict(args).values():
+            print(f'Return value {v}')
             return diffusers.models.unet_2d_condition.UNet2DConditionOutput(sample=th.tensor(v, dtype=th.float32))
 
 class TextEncoderWrapper:
@@ -124,7 +129,6 @@ class TextEncoderWrapper:
         print("loading saved coreml model"); self.f = ct.models.MLModel(out_name, compute_units=ct.ComputeUnit.CPU_AND_GPU); print("loaded")
     
     def __call__(self, input):
-        print(f"Input ids: {input.float()}")
         args = args = {"input_ids_1": input.float().numpy()}
         for v in self.f.predict(args).values():
             return (th.tensor(v, dtype=th.float32),)
@@ -171,7 +175,12 @@ pipe.vae = VAEWrapper(
             PostQuantConvWrapper(pipe.vae.post_quant_conv)) 
 
 pipe.safety_checker = lambda images, **kwargs: (images, False)
-generator = torch.Generator("cpu").manual_seed(123)
+#generator = torch.Generator("cpu").manual_seed(123)
+with open("noise.bin", "rb") as f:
+    data = np.fromfile(f, dtype=np.float32)
+array = np.reshape(data, [1, 4, 64, 64])
+loaded_noise = torch.from_numpy(array)
 prompt = "discovering ancient ruins, concept art by JaeCheol Park"
-image = pipe(prompt, num_inference_steps=21, generator=generator).images[0]
+#image = pipe(prompt, num_inference_steps=21, generator=generator).images[0]
+image = pipe(prompt, latents=loaded_noise, num_inference_steps=21).images[0]
 image.save("ruins.png")

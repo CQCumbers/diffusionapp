@@ -199,10 +199,12 @@ static void vocab_init(bpe_context_t ctx, FILE *file) {
 bpe_context_t bpe_init(const char *vocab, const char *merges) {
     bpe_context_t ctx = calloc(1, sizeof(struct BpeContext));
     FILE *vocab_file = fopen(vocab, "r");
+    if (!vocab_file) return printf("No vocab: %s\n", vocab), ctx;
     vocab_init(ctx, vocab_file);
     fclose(vocab_file);
 
     FILE *merges_file = fopen(merges, "r");
+    if (!merges_file) return printf("No merges: %s\n", merges), ctx;
     rule_init(ctx, merges_file);
     fclose(merges_file);
     return ctx;
