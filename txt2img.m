@@ -32,16 +32,16 @@ static MLModel *load_model(NSString *name, int device, NSError **err) {
 
 static void print_array(float *array, int *strides, int indent) {
     /* pretty print an MLMultiArray */
-    for (int i = 0; i < indent; ++i) printf(" ");
-    printf("[ ");
+    int inner = strides[1] == 1, dot_i = inner ? 0 : indent + 2;
+    char sep = inner ? ' ' : '\n';
+    printf("%*s[%c", indent, "", sep);
     for (int i = 0, len = strides[0] / strides[1]; i < len; ++i) {
-        if (i >= 3 && i < len - 3) continue;
+        if (i >= 3 && i < len - 3) printf("%*s...%c", dot_i, "", sep), i = len - 3;
         float *elem = array + i * strides[1];
-        if (strides[1] == 1) printf("%f ", *elem);
+        if (inner) printf("%f ", *elem);
         else print_array(elem, strides + 1, indent + 2);
     }
-    for (int i = 0; i < indent; ++i) printf(" ");
-    printf("]\n");
+    printf("%*s]\n", inner ? 0 : indent, "");
 }
 
 /* === DDIM? scheduler === */
