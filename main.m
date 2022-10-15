@@ -1,20 +1,12 @@
 #import <Cocoa/Cocoa.h>
+#import "txt2img.h"
 
-// design async api based on io_uring or ioctl?
+@interface IntegerFormatter : NSNumberFormatter
+@end
 
-typedef struct Request {
-  char prompt[4096];
-  int strength, steps;
-  int guide, seed;
-} request_t;
+@interface PromptFormatter : NSFormatter
+@end
 
-static request_t appControls;
-static int appStatus;
-static 
-
-// Implement everything in mockup
-// except image options/dropdown
-// Connect to inference backend
 @interface Label : NSTextField
 - (instancetype)initWithFrame:(NSRect)frame;
 - (void)styleAsTitle;
@@ -25,23 +17,67 @@ static
   NSProgressIndicator *runProgress;
   Label* runStatus;
   NSButton *runButton;
+  NSButton *saveButton;
 
   NSTextField *strengthBox;
   NSTextField *stepsBox;
   NSTextField *guideBox;
   NSTextField *seedBox;
-  NSButton *saveButton;
+
+  NSStepper *strengthStep;
+  NSStepper *stepsStep;
+  NSStepper *guideStep;
+  NSStepper *seedStep;
 }
 - (instancetype)initWithFrame:(NSRect)frame;
+- (void)fillRequest:(t2i_request_t*)req;
+- (void)setRunStatus:(NSString*)string progress:(double)progress;
+- (void)setRunEnabled:(BOOL)enabled;
+- (IBAction)setStrength:(id)sender;
+- (IBAction)setSteps:(id)sender;
+- (IBAction)setGuide:(id)sender;
+- (IBAction)setSeed:(id)sender;
 @end
 
 @interface Window : NSWindow {
   NSSplitView *splitView;
   NSImageView *imageView;
   RightPanel *rightPanel;
+  t2i_t engine;
+  int submit_id;
 }
 - (instancetype)init;
+- (int)onStatus:(int)status req:(int)req_id;
 - (BOOL)windowShouldClose:(id)sender;
+- (IBAction)runModel:(id)sender;
+- (IBAction)saveImage:(id)sender;
+@end
+
+@implementation IntegerFormatter
+- (BOOL)isPartialStringValid:(NSString*)partialString
+    newEditingString:(NSString**)newString errorDescription:(NSString**)error {
+  if ([partialString length] == 0) return YES;
+  NSScanner* scanner = [NSScanner scannerWithString:partialString];
+  int value; BOOL allInteger = [scanner scanInt:&value] && [scanner isAtEnd];
+  return allInteger && value >= 0 && value <= 100;
+}
+@end
+
+@implementation PromptFormatter
+- (NSString*)stringForObjectValue:(id)object {
+  return (NSString*)object;
+}
+
+- (BOOL)getObjectValue:(id*)object forString:(NSString*)string errorDescription:(NSString**)error {
+  *object = string;
+  return YES;
+}
+
+- (BOOL)isPartialStringValid:(NSString**)partialStringPtr
+    proposedSelectedRange:(NSRangePointer)newRange originalString:(NSString*)oldString
+    originalSelectedRange:(NSRange)oldRange errorDescription:(NSString**)error {
+  return [*partialStringPtr length] < N_TOKENS;
+}
 @end
 
 @implementation Label
@@ -63,7 +99,8 @@ static
 @end
 
 @implementation RightPanel
-- (NSTextField*)addNumberOption:(NSString*)name {
+- (void)addIntegerOption:(NSString*)name value:(int)value action:(SEL)action
+    text:(NSTextField**)text stepper:(NSStepper**)stepper {
   Label *label = [[[Label alloc] initWithFrame:CGRectZero] autorelease];
   [label setTranslatesAutoresizingMaskIntoConstraints:NO];
   [label setStringValue:name];
@@ -71,18 +108,25 @@ static
 
   NSTextField *option = [[[NSTextField alloc] initWithFrame:CGRectZero] autorelease];
   [option setTranslatesAutoresizingMaskIntoConstraints:NO];
-  [option setStringValue:@"50"];
+  IntegerFormatter *formatter = [[[IntegerFormatter alloc] init] autorelease];
+  [option setFormatter:formatter];
+  [option setIntegerValue:50];
+  [option setTarget:self];
+  [option setAction:action];
   [self addSubview:option];
 
-  NSStepper *stepper = [[[NSStepper alloc] initWithFrame:CGRectZero] autorelease];
-  [stepper setTranslatesAutoresizingMaskIntoConstraints:NO];
-  [self addSubview:stepper];
+  NSStepper *control = [[[NSStepper alloc] initWithFrame:CGRectZero] autorelease];
+  [control setTranslatesAutoresizingMaskIntoConstraints:NO];
+  [control setMaxValue:100];
+  [control setIntegerValue:value];
+  [control setAction:action];
+  [self addSubview:control];
 
   [self addConstraints:[NSLayoutConstraint
-    constraintsWithVisualFormat:@"H:|-[label(==104)]-[option]-[stepper]-|"
+    constraintsWithVisualFormat:@"H:|-[label(==104)]-[option]-[control]-|"
     options:NSLayoutFormatAlignAllCenterY metrics:nil
-    views:NSDictionaryOfVariableBindings(label, option, stepper)]];
-  return option;
+    views:NSDictionaryOfVariableBindings(label, option, control)]];
+  *text = option, *stepper = control;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -96,32 +140,38 @@ static
   [promptTitle styleAsTitle];
   [self addSubview:promptTitle];
 
-  promptBox = [[[NSTextField alloc] initWithFrame:CGRectZero] autorelease];
+  promptBox = [[NSTextField alloc] initWithFrame:CGRectZero];
   [promptBox setTranslatesAutoresizingMaskIntoConstraints:NO];
+  PromptFormatter *formatter = [[[PromptFormatter alloc] init] autorelease];
+  [promptBox setFormatter:formatter];
   [promptBox setStringValue:@"discovering ancient ruins, concept art by JaeCheol Park"];
   [self addSubview:promptBox];
 
-  runProgress = [[[NSProgressIndicator alloc] initWithFrame:CGRectZero] autorelease];
+  runProgress = [[NSProgressIndicator alloc] initWithFrame:CGRectZero];
   [runProgress setTranslatesAutoresizingMaskIntoConstraints:NO];
   [runProgress setStyle:NSProgressIndicatorStyleSpinning];
+  [runProgress setControlSize:NSControlSizeSmall];
+  [runProgress setIndeterminate:NO];
   [runProgress setDoubleValue:100];
   [self addSubview:runProgress];
 
-  runStatus = [[[Label alloc] initWithFrame:CGRectZero] autorelease];
+  runStatus = [[Label alloc] initWithFrame:CGRectZero];
   [runStatus setTranslatesAutoresizingMaskIntoConstraints:NO];
   [runStatus setStringValue:@"Finished"];
   [runStatus setTextColor:NSColor.secondaryLabelColor];
   [self addSubview:runStatus];
 
-  runButton = [[[NSButton alloc] initWithFrame:CGRectZero] autorelease];
+  runButton = [[NSButton alloc] initWithFrame:CGRectZero];
   [runButton setTranslatesAutoresizingMaskIntoConstraints:NO];
   [runButton setTitle:@"Run"];
   [runButton setBezelStyle:NSBezelStyleRounded];
+  [runButton setEnabled:NO];
+  [runButton setAction:@selector(runModel:)];
   [self addSubview:runButton];
 
   /* Constrain layout of prompt controls */
   [self addConstraints:[NSLayoutConstraint
-    constraintsWithVisualFormat:@"V:|-[promptTitle]-16-[promptBox(>=40)]-16-[runProgress(==16)]"
+    constraintsWithVisualFormat:@"V:|-[promptTitle]-16-[promptBox(==80)]-16-[runProgress(==16)]"
     options:NSLayoutFormatAlignAllLeft metrics:nil
     views:NSDictionaryOfVariableBindings(promptTitle, promptBox, runProgress)]];
   [self addConstraints:[NSLayoutConstraint
@@ -145,15 +195,20 @@ static
   [optionsTitle styleAsTitle];
   [self addSubview:optionsTitle];
 
-  strengthBox = [self addNumberOption:@"Strength"];
-  stepsBox = [self addNumberOption:@"Denoising Steps"];
-  guideBox = [self addNumberOption:@"Guidance Scale"];
-  seedBox = [self addNumberOption:@"Random Seed"];
+  [self addIntegerOption:@"Strength" value:50
+    action:@selector(setStrength:) text:&strengthBox stepper:&strengthStep];
+  [self addIntegerOption:@"Denoising Steps" value:21
+    action:@selector(setSteps:) text:&stepsBox stepper:&stepsStep];
+  [self addIntegerOption:@"Guidance Scale" value:75
+    action:@selector(setGuide:) text:&guideBox stepper:&guideStep];
+  [self addIntegerOption:@"Random Seed" value:42
+    action:@selector(setSeed:) text:&seedBox stepper:&seedStep];
 
-  saveButton = [[[NSButton alloc] initWithFrame:CGRectZero] autorelease];
+  saveButton = [[NSButton alloc] initWithFrame:CGRectZero];
   [saveButton setTranslatesAutoresizingMaskIntoConstraints:NO];
   [saveButton setTitle:@"Save Image"];
   [saveButton setBezelStyle:NSBezelStyleRounded];
+  [saveButton setAction:@selector(saveImage:)];
   [self addSubview:saveButton];
 
   /* Constrain layout of model options controls */
@@ -177,19 +232,80 @@ static
 
   return self;
 }
+
+- (void)fillRequest:(t2i_request_t*)req {
+  strncpy(req->prompt, [[promptBox stringValue] UTF8String], N_TOKENS);
+  req->strength = [strengthBox integerValue];
+  req->steps = [stepsBox integerValue];
+  req->guide = [guideBox integerValue];
+  req->seed = [seedBox integerValue];
+}
+
+- (void)setRunStatus:(NSString*)string progress:(double)progress {
+  [runStatus setStringValue:string];
+  [runProgress setDoubleValue:progress];
+}
+
+- (void)setRunEnabled:(BOOL)enabled {
+  [runButton setEnabled:enabled];
+}
+
+- (IBAction)setStrength:(id)sender {
+  [strengthBox setIntegerValue:[sender integerValue]];
+  [strengthStep setIntegerValue:[sender integerValue]];
+}
+
+- (IBAction)setSteps:(id)sender {
+  [stepsBox setIntegerValue:[sender integerValue]];
+  [stepsStep setIntegerValue:[sender integerValue]];
+}
+
+- (IBAction)setGuide:(id)sender {
+  [guideBox setIntegerValue:[sender integerValue]];
+  [guideStep setIntegerValue:[sender integerValue]];
+}
+
+- (IBAction)setSeed:(id)sender {
+  [seedBox setIntegerValue:[sender integerValue]];
+  [seedStep setIntegerValue:[sender integerValue]];
+}
 @end
 
+static int handler(void *ctx, int req_id, int status) {
+  __block int handler_err = 0;
+  dispatch_async_and_wait(dispatch_get_main_queue(), ^{
+    Window *window = (__bridge Window*)ctx;
+    handler_err = [window onStatus:status req:req_id];
+  });
+  return handler_err;
+}
+
 @implementation Window
+- (NSImage*)createImage:(char*)bytes {
+  NSData *data = [NSData dataWithBytes:bytes length:512 * 512 * 3];
+  CGColorSpaceRef colorspace = CGColorSpaceCreateDeviceRGB();
+  CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+  CGImageRef imageRef = CGImageCreate(512, 512, 8, 8 * 3, 512 * 3, colorspace,
+    kCGImageAlphaNone | kCGBitmapByteOrderDefault, provider, NULL, false, kCGRenderingIntentDefault);
+
+  NSBitmapImageRep *bitmapRep = [[NSBitmapImageRep alloc] initWithCGImage:imageRef];
+  NSImage *image = [[NSImage alloc] init];
+  [image addRepresentation:bitmapRep];
+  return image;
+}
+
 - (instancetype)init {
   /* create UI components */
-  splitView = [[[NSSplitView alloc] initWithFrame:CGRectZero] autorelease];
+  splitView = [[NSSplitView alloc] initWithFrame:CGRectZero];
   [splitView setTranslatesAutoresizingMaskIntoConstraints:NO];
   [splitView setDividerStyle:NSSplitViewDividerStylePaneSplitter];
   [splitView setVertical:YES];
 
-  imageView = [[[NSImageView alloc] initWithFrame:CGRectZero] autorelease];
+  engine = t2i_init(handler, self);
+  imageView = [[NSImageView alloc] initWithFrame:CGRectZero];
+  [imageView setImage:[self createImage:t2i_request(engine, 0)->image]];
   [splitView addSubview:imageView];
-  rightPanel = [[[RightPanel alloc] initWithFrame:CGRectZero] autorelease];
+  rightPanel = [[RightPanel alloc] initWithFrame:CGRectZero];
   [splitView addSubview:rightPanel];
 
   /* Setup window view */
@@ -217,9 +333,48 @@ static
   return self;
 }
 
+- (int)onStatus:(int)status req:(int)req_id {
+  NSLog(@"Received status %d for %d", status, req_id);
+  if (req_id != -1 && req_id != submit_id) return 1;
+
+  if (status == T2I_UNLOADED) {
+    [rightPanel setRunStatus:@"Loading Encoder" progress:10];
+  } else if (status == T2I_ENCODER_LOADED) {
+    [rightPanel setRunStatus:@"Loading UNet" progress:30];
+  } else if (status == T2I_UNET_LOADED) {
+    [rightPanel setRunStatus:@"Loading Decoder" progress:80];
+  } else if (status == T2I_DECODER_LOADED) {
+    [rightPanel setRunStatus:@"Loading finished" progress:100];
+    [rightPanel setRunEnabled:YES];
+  } else if (status >= T2I_STEPS) {
+    int steps = status - T2I_STEPS, total = t2i_request(engine, req_id)->steps;
+    NSString *str = [NSString stringWithFormat:@"Running step %d / %d", steps, total];
+    [rightPanel setRunStatus:str progress:steps * 100 / total];
+  } else if (status == T2I_FINISHED) {
+    [rightPanel setRunStatus:@"Inference Finished" progress:100];
+  }
+  return 0;
+}
+
 - (BOOL)windowShouldClose:(id)sender {
   [NSApp terminate:sender];
   return YES;
+}
+
+- (IBAction)runModel:(id)sender {
+  /* Attempt to acquire id */
+  int req_id = t2i_acquire(engine);
+  if (req_id == -1) return;
+
+  /* Submit inference request */
+  [rightPanel fillRequest:t2i_request(engine, req_id)];
+  t2i_submit(engine, submit_id = req_id);
+  [imageView setImage:[self createImage:t2i_request(engine, submit_id)->image]];
+  [rightPanel setRunStatus:@"Starting Inference" progress:0];
+}
+
+- (IBAction)saveImage:(id)sender {
+  NSSavePanel* panel = [NSSavePanel savePanel];
 }
 @end
 

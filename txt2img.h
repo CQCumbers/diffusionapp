@@ -26,7 +26,7 @@ typedef struct {
 
 struct T2IEngine;
 typedef struct T2IEngine *t2i_t;
-typedef int (*t2i_handler_t)(void *ctx, t2i_request_t *req, int status);
+typedef int (*t2i_handler_t)(void *ctx, int req_id, int status);
 
 t2i_t t2i_init(t2i_handler_t handler, void *ctx);
 void t2i_free(t2i_t engine);

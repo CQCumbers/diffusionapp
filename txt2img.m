@@ -338,9 +338,8 @@ static void *worker_main(void *args) {
 
 /* === Command line tests === */
 
-static int logger(void *ctx, t2i_request_t *req, int status) {
-    /* log error states */
-    printf("Logger status %d\n", status);
+/*static int logger(void *ctx, int req_id, int status) {
+    printf("Status %d for %d\n", status, req_id);
     return 0;
 }
 
@@ -352,10 +351,8 @@ int main (int argc, char *argv[]) {
     t2i_request_t *req = t2i_request(engine, req_id);
     strncpy(req->prompt, argv[1], N_TOKENS);
     req->steps = 21, req->seed = 123;
-    /* implement guide/seed */
 
     t2i_submit(engine, req_id);
-    /* wait for finish signal */
     t2i_free(engine);
     return 0;
-}
+}*/
