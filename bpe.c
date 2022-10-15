@@ -5,7 +5,7 @@
 #include <string.h>
 
 typedef struct {
-    unsigned rule;
+    int rule;
     short token_l;
     short byte_r;
 } pair_t;
@@ -18,7 +18,7 @@ typedef struct {
 typedef struct {
     unsigned dist;
     unsigned hash;
-    unsigned rule;
+    int rule;
 } slot_t;
 
 #define N_SLOTS 65536
@@ -69,7 +69,7 @@ static void heap_make(pair_t *data, unsigned size) {
     }
 }
 
-static unsigned hash_add(slot_t *table, unsigned size, unsigned hash, unsigned rule) {
+static int hash_add(slot_t *table, unsigned size, unsigned hash, int rule) {
     slot_t item = { 1, hash, rule }, tmp;
     for (unsigned i = hash;; ++item.dist, ++i) {
         slot_t *slot = &table[i & (size - 1)];
@@ -79,7 +79,7 @@ static unsigned hash_add(slot_t *table, unsigned size, unsigned hash, unsigned r
     }
 }
 
-static unsigned hash_get(const slot_t *table, unsigned size, unsigned hash) {
+static int hash_get(const slot_t *table, unsigned size, unsigned hash) {
     if (size == 0) return -1;
     for (unsigned dist = 1, i = hash;; ++dist, ++i) {
         const slot_t *slot = &table[i & (size - 1)];
@@ -110,12 +110,12 @@ static unsigned hash_mix(unsigned lhs, unsigned rhs) {
 
 /* === Tokenization helpers === */
 
-static unsigned rule_get(const slot_t *rules,
+static int rule_get(const slot_t *rules,
         token_t token_l, token_t token_r, const char *text) {
     if (text[token_r.byte_l] == ' ') return 0;
     unsigned hash_l = hash_token(token_l, text);
     unsigned hash_r = hash_token(token_r, text);
-    unsigned val = hash_get(rules, N_SLOTS, hash_mix(hash_l, hash_r));
+    int val = hash_get(rules, N_SLOTS, hash_mix(hash_l, hash_r));
     return val;
 }
 
@@ -148,11 +148,12 @@ static void rule_init(bpe_context_t ctx, FILE *file) {
 static void vocab_init(bpe_context_t ctx, FILE *file) {
     char string[MAX_LINE], number[MAX_LINE];
     char ch, *end;
-    int n_string, n_number, state = 0;
-    unsigned hash = 0, token_id = 0;
+    int n_string, n_number;
+    int state = 0, token_id = 0;
 
     unsigned bos_hash = hash_string("<|startoftext|>");
     unsigned eos_hash = hash_string("<|endoftext|>");
+    unsigned hash;
 
     while (fread(&ch, 1, 1, file)) {
         switch (state) {
@@ -221,12 +222,12 @@ int bpe_encode(bpe_context_t ctx, const char *text, float *ids, int capacity) {
     if (length >= N_TOKENS) return printf("Too much text%d\n", length), 0;
     for (short i = 0; i < length; ++i)
         list[i] = (token_t){ i - 1, i + 1, i, i + 1 };
-    list[length - 1].next = -1;
+    if (length) list[length - 1].next = -1;
 
     /* initialize merge agenda */
     unsigned n_agenda = 0;
     for (short i = 1; i < length; ++i) {
-        unsigned rule = rule_get(ctx->rules, list[i - 1], list[i], text);
+        int rule = rule_get(ctx->rules, list[i - 1], list[i], text);
         pair_t new_pair = { rule, i - 1, list[i].byte_r };
         if (rule != -1) ctx->agenda[n_agenda++] = new_pair;
     }
@@ -252,12 +253,12 @@ int bpe_encode(bpe_context_t ctx, const char *text, float *ids, int capacity) {
 
         /* add new pairs to agenda */
         if (prev != -1) {
-            unsigned rule = rule_get(ctx->rules, list[prev], list[curr], text);
+            int rule = rule_get(ctx->rules, list[prev], list[curr], text);
             pair_t new_pair = { rule, prev, list[curr].byte_r };
             if (rule != -1) heap_push(ctx->agenda, n_agenda++, new_pair);
         }
         if (next != -1) {
-            unsigned rule = rule_get(ctx->rules, list[curr], list[next], text);
+            int rule = rule_get(ctx->rules, list[curr], list[next], text);
             pair_t new_pair = { rule, curr, list[next].byte_r };
             if (rule != -1) heap_push(ctx->agenda, n_agenda++, new_pair);
         }
@@ -268,7 +269,7 @@ int bpe_encode(bpe_context_t ctx, const char *text, float *ids, int capacity) {
     for (int i = 0; i < length; ++i) {
         if (list[i].byte_l == -1) continue;
         unsigned hash = hash_token(list[i], text);
-        unsigned token_id = hash_get(ctx->vocab, N_SLOTS, hash);
+        int token_id = hash_get(ctx->vocab, N_SLOTS, hash);
         if (token_id == -1) token_id = ctx->eos_id;
         if (++n_ids < capacity) ids[n_ids] = token_id;
     }
