@@ -201,6 +201,16 @@ typedef struct {
     MLPredictionOptions *options;
 } model_t;
 
+typedef struct {
+    float *embeds;
+    float *latents;
+    float *e_t;
+    float *image;
+    float *alphas;
+    unsigned rng[4];
+    float step;
+} buffers_t;
+
 static model_t *encoder_init(MLModel *model, float *ids, float *embeds) {
     model_t *enc = malloc(sizeof(model_t));
     NSError *err = NULL;
@@ -275,120 +285,136 @@ static model_t *decoder_init(MLModel *model, float *z, float *image) {
     return dec;
 }
 
-static void *worker_main(void *args) {
-    t2i_t engine = args;
+static int process_request(t2i_t engine, int req_id, model_t *enc,
+        model_t *unet, model_t *quant, model_t *dec, buffers_t data) {
+    t2i_handler_t handle = engine->handler;
     void *ctx = engine->context;
 
+    /* Get encoder output embeddings */
+    NSError *err = NULL;
+    [enc->model predictionFromFeatures:enc->inputs options:enc->options error:&err];
+    if (err) return handle(ctx, req_id, T2I_ENCODER_FAILED);
+
+    NSLog(@"\nEncoder output:\n");
+    int embeds_s[] = { 77 * 768, 768, 1 };
+    print_array(data.embeds + 77 * 768, embeds_s, 0);
+
+    /* Setup scheudler alphas */
+    t2i_request_t *req = t2i_request(engine, req_id);
+    if (req->steps > 127) req->steps = 127;
+    sched_init(data.alphas, 0.00085, 0.0120, req->steps);
+
+    /* Generate latent noise vector */
+    const int n_noise = 4 * 64 * 64;
+    float *latents = data.latents, *e_t = data.e_t;
+    xoshiro_seed(data.rng, req->seed);
+    for (int i = 0; i < n_noise; i += 2)
+        gaussians_next(data.rng, &latents[i]);
+
+    const int max_filename = 128;
+    char filename[max_filename];
+    float guidance = req->guide / 10.0f;
+    for (int i = 0; i < req->steps; ++i, data.step -= 1000 / req->steps) {
+        /* run UNet to predict noise residual */
+        NSLog(@"Running step %d: %f\n", i, data.step);
+        if (handle(ctx, req_id, T2I_STEPS + i)) return 1;
+        memcpy(latents + n_noise, latents, n_noise * sizeof(float));
+
+        NSLog(@"\nUNet Input:\n");
+        print_array(data.embeds, embeds_s, 0);
+        NSLog(@"\nLatent values:\n");
+        int latents_s[] = { 4 * 64 * 64, 64 * 64, 64, 1 };
+        print_array(latents, latents_s, 0);
+
+        [unet->model predictionFromFeatures:unet->inputs options:unet->options error:&err];
+        if (err) return handle(ctx, req_id, T2I_UNET_FAILED);
+
+        /* Perform guidance */
+        for (int i = 0; i < n_noise; ++i)
+            e_t[i] += guidance * (e_t[n_noise + i] - e_t[i]);
+
+        NSLog(@"\ne_t values:\n");
+        print_array((float*)e_t, latents_s, 0);
+
+        /* Compute previous noisy sample */
+        sched_step(data.alphas, i, e_t, latents, n_noise);
+        for (int i = 0; i < n_noise; ++i)
+            e_t[i] = 1.0 / 0.18215 * latents[i];
+
+        /* Decode latents into image */
+        [quant->model predictionFromFeatures:quant->inputs options:quant->options error:&err];
+        if (err) return handle(ctx, req_id, T2I_UNET_FAILED);
+        [dec->model predictionFromFeatures:dec->inputs options:dec->options error:&err];
+        if (err) return handle(ctx, req_id, T2I_UNET_FAILED);
+
+        for (int i = 0; i < 512 * 512; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                float pixel = data.image[j * 512 * 512 + i];
+                req->image[i * 3 + j] = (unsigned char)(pixel * 127 + 128);
+            }
+        }
+        snprintf(filename, max_filename, "step_%d.png", i);
+        stbi_write_png(filename, 512, 512, 3, req->image, 512 * 3);
+    }
+
+    NSLog(@"Successfully finished processing");
+    return 0;
+}
+
+static void *worker_main(void *args) {
+    t2i_t engine = (t2i_t)args;
+    t2i_handler_t handle = engine->handler;
+    void *ctx = engine->context;
+    buffers_t data;
+
     /* Initialize tokenizer */
-    const int n_ids = 77;
-    float *ids = calloc(n_ids, sizeof(float));
+    float *ids = calloc(77, sizeof(float));
     bpe_context_t tokenizer = bpe_init("vocab.json", "merges.txt");
-    bpe_encode(tokenizer, "", ids, n_ids);
+    bpe_encode(tokenizer, "", ids, 77);
 
     /* Load encoder model and buffers */
     NSArray *shape, *strides;
-    float *embeds = calloc(2 * 77 * 768, sizeof(float));
+    data.embeds = calloc(2 * 77 * 768, sizeof(float));
 
-    model_t *enc = encoder_init(NULL, ids, embeds + 77 * 768);
-    if (!enc) return engine->handler(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
-    model_t *uncond = encoder_init(enc->model, ids, embeds);
-    if (!uncond) return engine->handler(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
-    if (engine->handler(ctx, -1, T2I_ENCODER_LOADED)) return NULL;
+    model_t *enc = encoder_init(NULL, ids, data.embeds + 77 * 768);
+    if (!enc) return handle(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
+    model_t *uncond = encoder_init(enc->model, ids, data.embeds);
+    if (!uncond) return handle(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
+    if (handle(ctx, -1, T2I_ENCODER_LOADED)) return NULL;
 
     NSError *err = NULL;
     [uncond->model predictionFromFeatures:uncond->inputs options:uncond->options error:&err];
-    if (err) return engine->handler(ctx, -1, T2I_ENCODER_FAILED), NULL;
+    if (err) return handle(ctx, -1, T2I_ENCODER_FAILED), NULL;
 
     /* Load unet model and buffers */
-    const int n_noise = 4 * 64 * 64, max_steps = 128;
-    float (*e_t)[n_noise] = calloc(2 * n_noise, sizeof(float));
-    float (*latents)[n_noise] = calloc(2 * n_noise, sizeof(float));
-    float step = 0.0f;
+    const int n_noise = 4 * 64 * 64;
+    data.latents = calloc(2 * n_noise, sizeof(float));
+    data.e_t = calloc(2 * n_noise, sizeof(float));
+    data.step = 0.0f;
 
-    model_t *unet = unet_init(NULL, embeds, &step, (float*)latents, (float*)e_t);
-    if (!unet) return engine->handler(ctx, -1, T2I_UNET_NOLOAD), NULL;
-    if (engine->handler(ctx, -1, T2I_UNET_LOADED)) return NULL;
+    model_t *unet = unet_init(NULL, data.embeds, &data.step, data.latents, data.e_t);
+    if (!unet) return handle(ctx, -1, T2I_UNET_NOLOAD), NULL;
+    if (handle(ctx, -1, T2I_UNET_LOADED)) return NULL;
 
     /* Load decoder model and buffers */
-    const int max_filename = 64;
-    float *decoded = calloc(3 * 512 * 512, sizeof(float));
-    float alphas[max_steps + 1];
-    unsigned rng[4];
-    char filename[max_filename];
+    data.image = calloc(3 * 512 * 512, sizeof(float));
+    data.alphas = calloc(128, sizeof(float));
 
-    model_t *quant = quant_init(NULL, e_t[0], e_t[1]);
-    if (!quant) return engine->handler(ctx, -1, T2I_DECODER_NOLOAD), NULL;
-    model_t *dec = decoder_init(NULL, e_t[1], decoded);
-    if (!dec) return engine->handler(ctx, -1, T2I_DECODER_NOLOAD), NULL;
-    if (engine->handler(ctx, -1, T2I_DECODER_LOADED)) return NULL;
+    model_t *quant = quant_init(NULL, data.e_t, data.e_t + n_noise);
+    if (!quant) return handle(ctx, -1, T2I_DECODER_NOLOAD), NULL;
+    model_t *dec = decoder_init(NULL, data.e_t + n_noise, data.image);
+    if (!dec) return handle(ctx, -1, T2I_DECODER_NOLOAD), NULL;
+    if (handle(ctx, -1, T2I_DECODER_LOADED)) return NULL;
 
     for (;;) {
         /* Get request to process */
-        int req_id = queue_front(engine);
+        int req_id = queue_front(engine), err = 0;
         t2i_request_t *req = t2i_request(engine, req_id);
-        bpe_encode(tokenizer, req->prompt, ids, n_ids);
-
-        /* Get encoder output embeddings */
-        [enc->model predictionFromFeatures:enc->inputs options:enc->options error:&err];
-        if (err) engine->handler(ctx, req_id, T2I_ENCODER_FAILED);
-
-        printf("\nEncoder output:\n");
-        int embeds_s[] = { 77 * 768, 768, 1 };
-        print_array(embeds + 77 * 768, embeds_s, 0);
-
-        /* Generate latent noise vector */
-        if (req->steps > max_steps) req->steps = max_steps;
-        sched_init(alphas, 0.00085, 0.0120, req->steps);
-        xoshiro_seed(rng, req->seed);
-        for (int i = 0; i < n_noise; i += 2)
-            gaussians_next(rng, &latents[0][i]);
-
-        for (int i = 0; i < req->steps; ++i, step -= 1000 / req->steps) {
-            /* run UNet to predict noise residual */
-            NSLog(@"Running step %d: %f\n", i, step);
-            if (engine->handler(ctx, req_id, T2I_STEPS + i)) break;
-            memcpy(latents[1], latents[0], n_noise * sizeof(float));
-
-            printf("\nUNet Input:\n");
-            print_array(embeds, embeds_s, 0);
-            printf("\nLatent values:\n");
-            int latents_s[] = { 4 * 64 * 64, 64 * 64, 64, 1 };
-            print_array(latents[0], latents_s, 0);
-
-            [unet->model predictionFromFeatures:unet->inputs options:unet->options error:&err];
-            if (err) engine->handler(ctx, req_id, T2I_UNET_FAILED);
-
-            /* Perform guidance */
-            /* TODO: implement variable guide/strength */
-            for (int i = 0; i < n_noise; ++i)
-                e_t[0][i] += 7.5 * (e_t[1][i] - e_t[0][i]);
-
-            printf("\n\ne_t values:\n");
-            print_array((float*)e_t, latents_s, 0);
-
-            /* Compute previous noisy sample */
-            sched_step(alphas, i, e_t[0], latents[0], n_noise);
-            for (int i = 0; i < n_noise; ++i)
-                e_t[0][i] = 1.0 / 0.18215 * latents[0][i];
-
-            /* Decode latents into image */
-            [quant->model predictionFromFeatures:quant->inputs options:quant->options error:&err];
-            if (err) engine->handler(ctx, req_id, T2I_UNET_FAILED);
-            [dec->model predictionFromFeatures:dec->inputs options:dec->options error:&err];
-            if (err) engine->handler(ctx, req_id, T2I_UNET_FAILED);
-
-            for (int i = 0; i < 512 * 512; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    float pixel = decoded[j * 512 * 512 + i];
-                    req->image[i * 3 + j] = (unsigned char)(pixel * 127 + 128);
-                }
-            }
-            snprintf(filename, max_filename, "step_%d.png", i);
-            stbi_write_png(filename, 512, 512, 3, req->image, 512 * 3);
-        }
+        bpe_encode(tokenizer, req->prompt, ids, 77);
+        process_request(engine, req_id, enc, unet, quant, dec, data);
 
         /* Notify request finished */
-        engine->handler(ctx, req_id, T2I_FINISHED);
+        handle(ctx, req_id, T2I_FINISHED);
         queue_pop(engine, req_id);
     }
 
@@ -398,7 +424,7 @@ static void *worker_main(void *args) {
 /* === Command line tests === */
 
 /*static int logger(void *ctx, int req_id, int status) {
-    printf("Status %d for %d\n", status, req_id);
+    NSLog(@"Status %d for %d\n", status, req_id);
     return 0;
 }
 
