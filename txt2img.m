@@ -10,7 +10,7 @@
 
 /* === CoreML helpers === */
 
-static MLModel *load_model(NSString *name, int device, NSError **err) {
+static MLModel *load_model(NSString *name, int cpuOnly, NSError **err) {
     NSFileManager *manager = [NSFileManager defaultManager];
     NSString *cache = [NSString stringWithFormat:@"%@.mlmodelc", name];
     NSLog(@"Loading %@.mlmodelc", name);
@@ -25,9 +25,17 @@ static MLModel *load_model(NSString *name, int device, NSError **err) {
 
     NSURL *cache_url = [NSURL fileURLWithPath:cache];
     MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
-    config.computeUnits = device ? MLComputeUnitsAll : MLComputeUnitsCPUOnly;
+    config.computeUnits = cpuOnly ? MLComputeUnitsCPUOnly : MLComputeUnitsAll;
     return [MLModel modelWithContentsOfURL:cache_url
         configuration:config error:err];
+}
+
+static MLMultiArray *array_init(float *data, NSArray *shape, NSArray *strides) {
+    NSError *err = NULL;
+    MLMultiArray *array = [[MLMultiArray alloc] initWithDataPointer:data
+        shape:shape dataType:MLMultiArrayDataTypeFloat32 strides:strides
+        deallocator:^(void *bytes) { (void)bytes; } error:&err];
+    return array;
 }
 
 static void print_array(float *array, int *strides, int indent) {
@@ -114,7 +122,9 @@ static void gaussians_next(unsigned *s, float *out) {
 
 struct T2IEngine {
    t2i_request_t queue[N_QUEUE];
-   atomic_int head, tail;
+   int head, tail;
+   pthread_cond_t empty;
+   pthread_mutex_t mutex;
    pthread_t worker;
    t2i_handler_t handler;
    void *context;
@@ -123,14 +133,16 @@ struct T2IEngine {
 static void *worker_main(void *args);
 
 t2i_t t2i_init(t2i_handler_t handler, void *ctx) {
-    /* Allocate engine data and worker thread */
-    t2i_t engine = calloc(1, sizeof(struct T2IEngine));
+    /* Allocate engine data */
+    t2i_t engine = malloc(sizeof(struct T2IEngine));
+    engine->handler = handler, engine->context = ctx;
+    engine->head = 0, engine->tail = 0;
+    pthread_cond_init(&engine->empty, NULL);
+    pthread_mutex_init(&engine->mutex, NULL);
+
+    /* Start worker thread */
     int res = pthread_create(&engine->worker, NULL, worker_main, engine);
     if (res) return NSLog(@"pthread error: %d", res), NULL;
-
-    /* Store callback function */
-    engine->handler = handler;
-    engine->context = ctx;
     return engine;
 }
 
@@ -142,40 +154,126 @@ void t2i_free(t2i_t engine) {
 
 t2i_request_t *t2i_request(t2i_t engine, int req_id) {
     /* Assume valid and access synchronized */
+    assert(req_id != -1 && "Can't fetch invalid req_id");
     return &engine->queue[req_id % N_QUEUE];
 }
 
 int t2i_acquire(t2i_t engine) {
-    /* Avoid overwriting pending requests */
-    int head = atomic_load_explicit(&engine->head, memory_order_relaxed);
-    int tail = atomic_load_explicit(&engine->tail, memory_order_acquire);
+    /* Fail if too many pending requests */
+    pthread_mutex_lock(&engine->mutex);
+    int head = engine->head, tail = engine->tail;
+    pthread_mutex_unlock(&engine->mutex);
     return head < tail + N_QUEUE ? head : -1;
 }
 
 void t2i_submit(t2i_t engine, int req_id) {
-    /* Increment pending requests */
-    int head = atomic_load_explicit(&engine->head, memory_order_relaxed);
-    int tail = atomic_load_explicit(&engine->tail, memory_order_acquire);
+    /* Increment pending requests (req_id from acquire) */
+    pthread_mutex_lock(&engine->mutex);
+    int head = engine->head++;
+    pthread_cond_signal(&engine->empty);
+    pthread_mutex_unlock(&engine->mutex);
     assert(req_id == head && "Can't submit requests out of order");
-    atomic_store_explicit(&engine->head, head + 1, memory_order_release);
 }
 
 static int queue_front(t2i_t engine) {
-    /* Retrieve pending request */
-    int tail = atomic_load_explicit(&engine->tail, memory_order_relaxed);
-    int head = atomic_load_explicit(&engine->head, memory_order_acquire);
-    return tail < head ? tail : -1;
+    /* Wait for pending request */
+    pthread_mutex_lock(&engine->mutex);
+    int tail = engine->tail;
+    while (tail >= engine->head)
+        pthread_cond_wait(&engine->empty, &engine->mutex);
+    pthread_mutex_unlock(&engine->mutex);
+    return tail;
 }
 
 static void queue_pop(t2i_t engine, int req_id) {
-    /* Increment released requests */
-    int tail = atomic_load_explicit(&engine->tail, memory_order_relaxed);
-    int head = atomic_load_explicit(&engine->head, memory_order_acquire);
+    /* Increment released requests (req_id from front) */
+    pthread_mutex_lock(&engine->mutex);
+    int tail = engine->tail++;
+    pthread_mutex_unlock(&engine->mutex);
     assert(req_id == tail && "Can't release requests out of order");
-    atomic_store_explicit(&engine->tail, tail + 1, memory_order_release);
 }
 
 /* === Model implementation === */
+
+typedef struct {
+    MLModel *model;
+    MLDictionaryFeatureProvider *inputs;
+    MLPredictionOptions *options;
+} model_t;
+
+static model_t *encoder_init(MLModel *model, float *ids, float *embeds) {
+    model_t *enc = malloc(sizeof(model_t));
+    NSError *err = NULL;
+    enc->model = model ? model : load_model(@"text_encoder", 0, &err);
+    if (!enc->model) return free(enc), NULL;
+
+    MLMultiArray *enc_ids = array_init(ids, @[ @1, @77 ], @[ @77, @1 ]);
+    enc->inputs = [[MLDictionaryFeatureProvider alloc]
+        initWithDictionary:@{ @"input_ids_1":enc_ids } error:&err];
+    if (!enc->inputs) return free(enc), NULL;
+
+    MLMultiArray *enc_embeds = array_init(embeds, @[ @77, @768 ], @[ @768, @1 ]);
+    enc->options = [[MLPredictionOptions alloc] init];
+    [enc->options setOutputBackings:@{ @"last_hidden_state":enc_embeds }];
+    return enc;
+}
+
+static model_t *unet_init(MLModel *model,
+        float *embeds, float *step, float *latents, float *preds) {
+    model_t *unet = malloc(sizeof(model_t));
+    NSError *err = NULL;
+    unet->model = model ? model : load_model(@"unet", 0, &err);
+    if (!unet->model) return free(unet), NULL;
+
+    NSArray *shape = @[ @2, @4, @64, @64 ], *strides = @[ @16384, @4096, @64, @1 ];
+    MLMultiArray *u_embeds = array_init(embeds, @[ @2, @77, @768 ], @[ @59136, @768, @1 ]);
+    MLMultiArray *u_step = array_init(step, @[ @1 ], @[ @1 ]);
+    MLMultiArray *u_latents = array_init(latents, shape, strides);
+    unet->inputs = [[MLDictionaryFeatureProvider alloc]
+        initWithDictionary:@{ @"sample_1":u_latents, @"timestep":u_step, @"input_35":u_embeds } error:&err];
+    if (!unet->inputs) return free(unet), NULL;
+
+    MLMultiArray *u_preds = array_init(preds, shape, strides);
+    unet->options = [[MLPredictionOptions alloc] init];
+    [unet->options setOutputBackings:@{ @"var_5609":u_preds }];
+    return unet;
+}
+
+static model_t *quant_init(MLModel *model, float *preds, float *z) {
+    model_t *quant = malloc(sizeof(model_t));
+    NSError *err = NULL;
+    quant->model = model ? model : load_model(@"post_quant_conv", 0, &err);
+    if (!quant->model) return free(quant), NULL;
+
+    NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @4096, @4096, @64, @1 ];
+    MLMultiArray *quant_preds = array_init(preds, shape, strides);
+    quant->inputs = [[MLDictionaryFeatureProvider alloc]
+        initWithDictionary:@{ @"input":quant_preds } error:&err];
+    if (!quant->inputs) return free(quant), NULL;
+
+    MLMultiArray *quant_z = array_init(z, shape, strides);
+    quant->options = [[MLPredictionOptions alloc] init];
+    [quant->options setOutputBackings:@{ @"var_22":quant_preds }];
+    return quant;
+}
+
+static model_t *decoder_init(MLModel *model, float *z, float *image) {
+    model_t *dec = malloc(sizeof(model_t));
+    NSError *err = NULL;
+    dec->model = model ? model : load_model(@"vae_decoder", 0, &err);
+    if (!dec->model) return free(dec), NULL;
+
+    NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @4096, @4096, @64, @1 ];
+    MLMultiArray *dec_z = array_init(z, shape, strides);
+    dec->inputs = [[MLDictionaryFeatureProvider alloc]
+        initWithDictionary:@{ @"z":dec_z } error:&err];
+    if (!dec->inputs) return free(dec), NULL;
+
+    MLMultiArray *dec_image = array_init(image, @[ @3, @512, @512 ], @[ @262144, @512, @1 ]);
+    dec->options = [[MLPredictionOptions alloc] init];
+    [dec->options setOutputBackings:@{ @"var_730":dec_image }];
+    return dec;
+}
 
 static void *worker_main(void *args) {
     t2i_t engine = args;
@@ -187,88 +285,56 @@ static void *worker_main(void *args) {
     bpe_context_t tokenizer = bpe_init("vocab.json", "merges.txt");
     bpe_encode(tokenizer, "", ids, n_ids);
 
-    /* Load encoder model and inputs */
-    NSError *err = nil;
-    MLModel *encoder = load_model(@"text_encoder", 1, &err);
-    if (!encoder) return engine->handler(ctx, -1, T2I_ENCODER_NOLOAD);
+    /* Load encoder model and buffers */
+    NSArray *shape, *strides;
+    float *embeds = calloc(2 * 77 * 768, sizeof(float));
 
-    NSArray *shape = @[ @1, @(n_ids) ], *strides = @[ @(n_ids), @1 ];
-    MLMultiArray *encoder_ids = [[MLMultiArray alloc] initWithDataPointer:ids
-        shape:shape dataType:MLMultiArrayDataTypeFloat32 strides:strides
-        deallocator:^(void *bytes) { (void)bytes; } error:&err];
-    MLDictionaryFeatureProvider* encoder_in = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"input_ids_1":encoder_ids } error:&err];
-    if (!encoder_in) return engine->handler(ctx, -1, T2I_ENCODER_NOLOAD);
+    model_t *enc = encoder_init(NULL, ids, embeds + 77 * 768);
+    if (!enc) return engine->handler(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
+    model_t *uncond = encoder_init(enc->model, ids, embeds);
+    if (!uncond) return engine->handler(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
+    if (engine->handler(ctx, -1, T2I_ENCODER_LOADED)) return NULL;
 
-    id<MLFeatureProvider> encoder_out = [encoder predictionFromFeatures:encoder_in error:&err];
-    if (!encoder_out) return engine->handler(ctx, -1, T2I_ENCODER_FAILED);
-    MLMultiArray *uncond = [[encoder_out featureValueForName:@"last_hidden_state"] multiArrayValue];
+    NSError *err = NULL;
+    [uncond->model predictionFromFeatures:uncond->inputs options:uncond->options error:&err];
+    if (err) return engine->handler(ctx, -1, T2I_ENCODER_FAILED), NULL;
 
-    NSLog(@"encoder successfully loaded");
-    if (engine->handler(ctx, -1, T2I_ENCODER_LOADED)) return 1;
-
-    /* Load unet model and inputs */
-    const int n_noise = 4 * 64 * 64;
+    /* Load unet model and buffers */
+    const int n_noise = 4 * 64 * 64, max_steps = 128;
+    float (*e_t)[n_noise] = calloc(2 * n_noise, sizeof(float));
     float (*latents)[n_noise] = calloc(2 * n_noise, sizeof(float));
-    float *rescaled = calloc(n_noise, sizeof(float));
-    float *step = calloc(1, sizeof(float));
-    MLModel *unet = load_model(@"unet", 1, &err);
-    if (!unet) return engine->handler(ctx, -1, T2I_UNET_NOLOAD);
+    float step = 0.0f;
 
-    shape = @[ @2, @4, @64, @64 ], strides = @[ @16384, @4096, @64, @1 ];
-    MLMultiArray *unet_latents = [[MLMultiArray alloc] initWithDataPointer:latents
-        shape:shape dataType:MLMultiArrayDataTypeFloat32 strides:strides
-        deallocator:^(void *bytes) { (void)bytes; } error:&err];
-    MLMultiArray *unet_step = [[MLMultiArray alloc] initWithDataPointer:step
-        shape:@[ @1 ] dataType:MLMultiArrayDataTypeFloat32 strides:@[ @1 ]
-        deallocator:^(void *bytes) { (void)bytes; } error:&err];
+    model_t *unet = unet_init(NULL, embeds, &step, (float*)latents, (float*)e_t);
+    if (!unet) return engine->handler(ctx, -1, T2I_UNET_NOLOAD), NULL;
+    if (engine->handler(ctx, -1, T2I_UNET_LOADED)) return NULL;
 
-    NSLog(@"unet successfully loaded");
-    if (engine->handler(ctx, -1, T2I_UNET_LOADED)) return 1;
-
-    /* Load VAE and prepare inputs */
-    MLModel *post_quant = load_model(@"post_quant_conv", 1, &err);
-    if (!post_quant) return engine->handler(ctx, -1, T2I_DECODER_NOLOAD);
-    MLModel *decoder = load_model(@"vae_decoder", 1, &err);
-    if (!decoder) return engine->handler(ctx, -1, T2I_DECODER_NOLOAD);
-
-    shape = @[ @1, @4, @64, @64 ], strides = @[ @4096, @4096, @64, @1 ];
-    MLMultiArray *quant_latents = [[MLMultiArray alloc] initWithDataPointer:rescaled
-        shape:shape dataType:MLMultiArrayDataTypeFloat32 strides:strides
-        deallocator:^(void *bytes) { (void)bytes; } error:&err];
-    MLDictionaryFeatureProvider* post_quant_in = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"input":quant_latents } error:&err];
-
-    NSLog(@"decoder successfully loaded");
-    if (engine->handler(ctx, -1, T2I_DECODER_LOADED)) return 1;
-
-    const int max_filename = 64, max_steps = 128;
+    /* Load decoder model and buffers */
+    const int max_filename = 64;
+    float *decoded = calloc(3 * 512 * 512, sizeof(float));
     float alphas[max_steps + 1];
-    char filename[max_filename];
     unsigned rng[4];
+    char filename[max_filename];
+
+    model_t *quant = quant_init(NULL, e_t[0], e_t[1]);
+    if (!quant) return engine->handler(ctx, -1, T2I_DECODER_NOLOAD), NULL;
+    model_t *dec = decoder_init(NULL, e_t[1], decoded);
+    if (!dec) return engine->handler(ctx, -1, T2I_DECODER_NOLOAD), NULL;
+    if (engine->handler(ctx, -1, T2I_DECODER_LOADED)) return NULL;
 
     for (;;) {
         /* Get request to process */
         int req_id = queue_front(engine);
         t2i_request_t *req = t2i_request(engine, req_id);
-        bpe_encode(tokenizer, req->prompt, ids, N_TOKENS);
+        bpe_encode(tokenizer, req->prompt, ids, n_ids);
 
         /* Get encoder output embeddings */
-        encoder_out = [encoder predictionFromFeatures:encoder_in error:&err];
-        if (!encoder_out) engine->handler(ctx, req, T2I_ENCODER_FAILED);
-        MLMultiArray *embeds = [[encoder_out featureValueForName:@"last_hidden_state"] multiArrayValue];
+        [enc->model predictionFromFeatures:enc->inputs options:enc->options error:&err];
+        if (err) engine->handler(ctx, req_id, T2I_ENCODER_FAILED);
 
         printf("\nEncoder output:\n");
         int embeds_s[] = { 77 * 768, 768, 1 };
-        print_array(embeds.dataPointer, embeds_s, 0);
-
-        MLMultiArray *unet_embeds = [MLMultiArray
-            multiArrayByConcatenatingMultiArrays:@[ uncond, embeds ]
-            alongAxis:0 dataType:MLMultiArrayDataTypeFloat32];
-        MLDictionaryFeatureProvider* unet_in = [[MLDictionaryFeatureProvider alloc]
-            initWithDictionary: @{ @"sample_1":unet_latents, @"timestep":unet_step, @"input_35":unet_embeds }
-            error:&err];
-        if (!unet_in) engine->handler(ctx, req, T2I_UNET_NOLOAD);
+        print_array(embeds + 77 * 768, embeds_s, 0);
 
         /* Generate latent noise vector */
         if (req->steps > max_steps) req->steps = max_steps;
@@ -280,43 +346,36 @@ static void *worker_main(void *args) {
         for (int i = 0; i < req->steps; ++i, step -= 1000 / req->steps) {
             /* run UNet to predict noise residual */
             NSLog(@"Running step %d: %f\n", i, step);
-            if (engine->handler(ctx, req, T2I_STEPS + step)) break;
+            if (engine->handler(ctx, req_id, T2I_STEPS + i)) break;
             memcpy(latents[1], latents[0], n_noise * sizeof(float));
 
             printf("\nUNet Input:\n");
-            print_array(unet_embeds.dataPointer, embeds_s, 0);
+            print_array(embeds, embeds_s, 0);
             printf("\nLatent values:\n");
             int latents_s[] = { 4 * 64 * 64, 64 * 64, 64, 1 };
             print_array(latents[0], latents_s, 0);
 
-            id<MLFeatureProvider> unet_out = [unet predictionFromFeatures:unet_in error:&err];
-            if (!unet_out) engine->handler(ctx, req, T2I_UNET_FAILED);
-            MLMultiArray *pred = [[unet_out featureValueForName:@"var_5609"] multiArrayValue];
+            [unet->model predictionFromFeatures:unet->inputs options:unet->options error:&err];
+            if (err) engine->handler(ctx, req_id, T2I_UNET_FAILED);
 
             /* Perform guidance */
-            float (*e_t)[n_noise] = pred.dataPointer;
+            /* TODO: implement variable guide/strength */
             for (int i = 0; i < n_noise; ++i)
                 e_t[0][i] += 7.5 * (e_t[1][i] - e_t[0][i]);
 
             printf("\n\ne_t values:\n");
-            print_array(e_t, latents_s, 0);
+            print_array((float*)e_t, latents_s, 0);
 
             /* Compute previous noisy sample */
             sched_step(alphas, i, e_t[0], latents[0], n_noise);
             for (int i = 0; i < n_noise; ++i)
-                rescaled[i] = 1.0 / 0.18215 * latents[0][i];
+                e_t[0][i] = 1.0 / 0.18215 * latents[0][i];
 
             /* Decode latents into image */
-            id<MLFeatureProvider> post_quant_out = [post_quant predictionFromFeatures:post_quant_in error:&err];
-            if (!post_quant_out) engine->handler(ctx, req, T2I_DECODER_FAILED);
-            MLMultiArray *z = [[post_quant_out featureValueForName:@"var_22"] multiArrayValue];
-            MLDictionaryFeatureProvider *decoder_in = [[MLDictionaryFeatureProvider alloc]
-                initWithDictionary:@{ @"z":z } error:&err];
-
-            id<MLFeatureProvider> decoder_out = [decoder predictionFromFeatures:decoder_in error:&err];
-            if (!decoder_out) engine->handler(ctx, req, T2I_DECODER_FAILED);
-            MLMultiArray *decoder_z = [[decoder_out featureValueForName:@"var_730"] multiArrayValue];
-            float *decoded = decoder_z.dataPointer;
+            [quant->model predictionFromFeatures:quant->inputs options:quant->options error:&err];
+            if (err) engine->handler(ctx, req_id, T2I_UNET_FAILED);
+            [dec->model predictionFromFeatures:dec->inputs options:dec->options error:&err];
+            if (err) engine->handler(ctx, req_id, T2I_UNET_FAILED);
 
             for (int i = 0; i < 512 * 512; ++i) {
                 for (int j = 0; j < 3; ++j) {
@@ -329,7 +388,7 @@ static void *worker_main(void *args) {
         }
 
         /* Notify request finished */
-        engine->handler(ctx, req, T2I_FINISHED);
+        engine->handler(ctx, req_id, T2I_FINISHED);
         queue_pop(engine, req_id);
     }
 

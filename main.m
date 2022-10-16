@@ -110,7 +110,7 @@
   [option setTranslatesAutoresizingMaskIntoConstraints:NO];
   IntegerFormatter *formatter = [[[IntegerFormatter alloc] init] autorelease];
   [option setFormatter:formatter];
-  [option setIntegerValue:50];
+  [option setIntegerValue:value];
   [option setTarget:self];
   [option setAction:action];
   [self addSubview:option];
