@@ -9,9 +9,9 @@ diffusers = "*"
 ftfy = "*"
 scipy = "*"
 torch = "*"
-coremltools = "==6.0b2"
+coremltools = "==6.1"
 
 [dev-packages]
 
 [requires]
-python_version = "3.8"
+python_version = "3.10"
