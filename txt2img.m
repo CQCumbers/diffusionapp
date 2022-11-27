@@ -347,13 +347,14 @@ static void *worker_main(void *args) {
 
     /* Initialize tokenizer */
     float *ids = calloc(77, sizeof(float));
-    bpe_context_t tokenizer = bpe_init("vocab.json", "merges.txt");
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"bpe_context" ofType:@"bin"];
+    bpe_context_t tokenizer = bpe_init([path UTF8String]);
+    if (!tokenizer) return handle(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
     bpe_encode(tokenizer, "", ids, 77);
 
     /* Load encoder model and buffers */
     NSArray *shape, *strides;
     data.embeds = calloc(2 * 77 * 768, sizeof(float));
-
     model_t *enc = encoder_init(NULL, ids, data.embeds + 77 * 768);
     if (!enc) return handle(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
     model_t *uncond = encoder_init(enc->model, ids, data.embeds);

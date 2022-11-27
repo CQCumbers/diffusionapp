@@ -1,8 +1,11 @@
 #include "bpe.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 typedef struct {
     int rule;
@@ -108,8 +111,6 @@ static unsigned hash_mix(unsigned lhs, unsigned rhs) {
     return lhs;
 }
 
-/* === Tokenization helpers === */
-
 static int rule_get(const slot_t *rules,
         token_t token_l, token_t token_r, const char *text) {
     if (text[token_r.byte_l] == ' ') return 0;
@@ -119,100 +120,19 @@ static int rule_get(const slot_t *rules,
     return val;
 }
 
-static char *replace_end(char *string) {
-    /* replace word terminator with space */
-    size_t slen = strlen(string);
-    if (slen < 4 || strcmp(string + slen - 4, "</w>")) return string;
-    string[slen - 4] = ' ', string[slen - 3] = '\0';
-    return string;
-}
-
-
-#define MAX_LINE 512
-
-static void rule_init(bpe_context_t ctx, FILE *file) {
-    char buf[MAX_LINE];
-    for (int i = 0; fgets(buf, MAX_LINE, file); ++i) {
-        if (i * 8 > N_SLOTS * 7)
-            return (void)printf("Max rules reached: %d\n", i);
-        if (i == 0) continue;
-
-        char *token_l = strtok(buf, " \n");
-        char *token_r = replace_end(strtok(NULL, " \n"));
-        unsigned hash_l = hash_string(token_l);
-        unsigned hash_r = hash_string(token_r);
-        hash_add(ctx->rules, N_SLOTS, hash_mix(hash_l, hash_r), i);
-    }
-}
-
-static void vocab_init(bpe_context_t ctx, FILE *file) {
-    char string[MAX_LINE], number[MAX_LINE];
-    char ch, *end;
-    int n_string, n_number;
-    int state = 0, token_id = 0;
-
-    unsigned bos_hash = hash_string("<|startoftext|>");
-    unsigned eos_hash = hash_string("<|endoftext|>");
-    unsigned hash;
-
-    while (fread(&ch, 1, 1, file)) {
-        switch (state) {
-        case 0:
-            if (ch == '{') state = 1;
-            break;
-        case 1:
-            if (ch == '"') state = 2;
-            n_string = 0;
-            break;
-        case 2:
-            if (ch == '\\') state = 3;
-            else if (ch == '"') state = 4;
-            else string[n_string++] = ch;
-            break;
-        case 3:
-            string[n_string++] = ch;
-            state = 2;
-            break;
-        case 4:
-           if (ch == ':') state = 5;
-           n_number = 0;
-           break; 
-        case 5:
-           if (ch == ',') state = 1;
-           if (ch == '}') state = 0;
-           if (state != 5) {
-               string[n_string] = '\0';
-               hash = hash_string(replace_end(string));
-               end = number + n_number;
-               token_id = strtol(number, &end, 10);
-
-               if (hash == bos_hash) { ctx->bos_id = token_id; break; }
-               if (hash == eos_hash) { ctx->eos_id = token_id; break; }
-               hash_add(ctx->vocab, N_SLOTS, hash, token_id);
-           } else number[n_number++] = ch;
-           break;
-        }
-    }
-}
-
 /* === Interface functions === */
 
-bpe_context_t bpe_init(const char *vocab, const char *merges) {
-    bpe_context_t ctx = calloc(1, sizeof(struct BpeContext));
-    FILE *vocab_file = fopen(vocab, "r");
-    if (!vocab_file) return printf("No vocab: %s\n", vocab), ctx;
-    vocab_init(ctx, vocab_file);
-    fclose(vocab_file);
-
-    FILE *merges_file = fopen(merges, "r");
-    if (!merges_file) return printf("No merges: %s\n", merges), ctx;
-    rule_init(ctx, merges_file);
-    fclose(merges_file);
-    return ctx;
+bpe_context_t bpe_init(const char *path) {
+    int file = open(path, O_RDONLY);
+    if (file < 0) return printf("No file: %s\n", path), NULL;
+    printf("Mapping size %lu\n", sizeof(struct BpeContext));
+    bpe_context_t ctx = mmap(NULL, sizeof(struct BpeContext),
+        PROT_READ | PROT_WRITE, MAP_PRIVATE, file, 0);
+    return close(file), ctx;
 }
 
 void bpe_free(bpe_context_t ctx) {
-    free(ctx);
+    munmap(ctx, sizeof(struct BpeContext));
 }
 
 int bpe_encode(bpe_context_t ctx, const char *text, float *ids, int capacity) {

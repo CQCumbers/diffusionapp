@@ -4,6 +4,7 @@
 import os, sys, shutil, subprocess
 import diffusers, b2sdk.v2
 from diffusers import StableDiffusionPipeline
+from vocab import convert_vocab
 
 import coremltools as ct
 import torch as th
@@ -70,7 +71,7 @@ def convert_decoder(decoder, quant, out_name):
 
     f_trace = th.jit.trace(QuantDecoder(quant, decoder),
         (th.zeros(1, 4, 64, 64, dtype=th.float32)), strict=False, check_trace=False)
-    f_coreml = ct.convert(f_trace, 
+    f_coreml = ct.convert(f_trace,
         inputs=[ct.TensorType(shape=(1, 4, 64, 64))],
         convert_to="milinternal",
         compute_precision=ct.precision.FLOAT16,
@@ -111,10 +112,10 @@ def convert_unet(f, out_name):
     if "gelu" in _TORCH_OPS_REGISTRY: del _TORCH_OPS_REGISTRY["gelu"]
     @register_torch_op
     def gelu(context, node): context.add(mb.gelu(x=context[node.inputs[0]], name=node.name))
-    
+
     f_trace = th.jit.trace(Undictifier(f),
         (th.zeros(2, 4, 64, 64), th.zeros(1), th.zeros(2, 77, 768)), strict=False, check_trace=False)
-    f_coreml = ct.convert(f_trace, 
+    f_coreml = ct.convert(f_trace,
        inputs=[ct.TensorType(shape=(2, 4, 64, 64)), ct.TensorType(shape=(1,)), ct.TensorType(shape=(2, 77, 768))],
        convert_to="milinternal",
        compute_precision=ct.precision.FLOAT16,
@@ -160,7 +161,7 @@ class TextEncoderWrapper:
         compile_mlmodel(out_name)
         self.f = ct.models.MLModel(out_name, compute_units=ct.ComputeUnit.CPU_AND_GPU)
         print("Model loaded")
-    
+
     def __call__(self, input):
         args = {"in_ids": input.float().numpy()}
         for v in self.f.predict(args).values():
@@ -174,7 +175,7 @@ class DecoderWrapper:
         compile_mlmodel(out_name)
         self.f = ct.models.MLModel(out_name, compute_units=ct.ComputeUnit.CPU_AND_GPU)
         print("Model loaded")
-    
+
     def __call__(self, input):
         args = {"in_z": input.numpy()}
         for v in self.f.predict(args).values():
@@ -193,6 +194,7 @@ if __name__ == "__main__":
     # clear models directory
     shutil.rmtree("models")
     os.makedirs("models")
+    convert_vocab("models")
 
     # retrieve pytorch models from huggingface
     pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4",
