@@ -1,7 +1,8 @@
 .DS_Store
 .env
-*.mlmodel
+*.mlpackage
 *.mlmodelc
+*.zip
 merges.txt
 vocab.json
 ruins.png

@@ -68,8 +68,6 @@ def convert_text_encoder(text_encoder, out_name):
 def convert_decoder(decoder, quant, out_name):
     print("Generating decoder model")
 
-    # replace baddbmm beta with float
-
     f_trace = th.jit.trace(QuantDecoder(quant, decoder),
         (th.zeros(1, 4, 64, 64, dtype=th.float32)), strict=False, check_trace=False)
     f_coreml = ct.convert(f_trace, 
@@ -80,8 +78,9 @@ def convert_decoder(decoder, quant, out_name):
     f_coreml = ct.convert(f_coreml, convert_to="mlprogram")
 
     spec = f_coreml.get_spec()
-    ct.utils.rename_feature(spec, 'z', 'in_z')
-    ct.utils.rename_feature(spec, 'var_665', 'out_image')
+    ct.utils.rename_feature(spec, 'inp', 'in_z')
+    out_node = spec.description.output[0].name
+    ct.utils.rename_feature(spec, out_node, 'out_image')
     ct.models.utils.save_spec(spec, out_name, weights_dir=f_coreml.weights_dir)
 
 
@@ -127,7 +126,8 @@ def convert_unet(f, out_name):
     ct.utils.rename_feature(spec, 'sample', 'in_latents')
     ct.utils.rename_feature(spec, 'timestep', 'in_timestep')
     ct.utils.rename_feature(spec, 'input_35', 'in_embeds')
-    ct.utils.rename_feature(spec, 'var_5500', 'out_preds')
+    out_node = spec.description.output[0].name
+    ct.utils.rename_feature(spec, out_node, 'out_preds')
     ct.models.utils.save_spec(spec, out_name, weights_dir=f_coreml.weights_dir)
 
 

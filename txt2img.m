@@ -12,22 +12,11 @@
 
 static MLModel *load_model(NSString *name, int cpuOnly, NSError **err) {
     NSFileManager *manager = [NSFileManager defaultManager];
-    NSString *cache = [NSString stringWithFormat:@"%@.mlmodelc", name];
-    NSLog(@"Loading %@.mlmodelc", name);
-
-    if (![manager fileExistsAtPath:cache]) {
-        NSLog(@"Compiling from .mlmodel\n");
-        NSString *src = [NSString stringWithFormat:@"%@.mlmodel", name];
-        NSURL *src_url = [NSURL fileURLWithPath:src];
-        NSURL *tmp = [MLModel compileModelAtURL:src_url error:err];
-        [manager copyItemAtPath:tmp.path toPath:cache error:err];
-    }
-
-    NSURL *cache_url = [NSURL fileURLWithPath:cache];
+    NSLog(@"Loading %@ from mlmodelc\n", name);
+    NSURL *url = [[NSBundle mainBundle] URLForResource:name withExtension:@"mlmodelc"];
     MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
-    config.computeUnits = cpuOnly ? MLComputeUnitsCPUOnly : MLComputeUnitsAll;
-    return [MLModel modelWithContentsOfURL:cache_url
-        configuration:config error:err];
+    config.computeUnits = cpuOnly ? MLComputeUnitsCPUOnly : MLComputeUnitsCPUAndGPU;
+    return [MLModel modelWithContentsOfURL:url configuration:config error:err];
 }
 
 static MLMultiArray *array_init(float *data, NSArray *shape, NSArray *strides) {
@@ -214,86 +203,71 @@ typedef struct {
 static model_t *encoder_init(MLModel *model, float *ids, float *embeds) {
     model_t *enc = malloc(sizeof(model_t));
     NSError *err = NULL;
-    enc->model = model ? model : load_model(@"text_encoder", 0, &err);
+    enc->model = model ? model : load_model(@"txt_encoder", 0, &err);
     if (!enc->model) return free(enc), NULL;
 
     MLMultiArray *enc_ids = array_init(ids, @[ @1, @77 ], @[ @77, @1 ]);
     enc->inputs = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"input_ids_1":enc_ids } error:&err];
+        initWithDictionary:@{ @"in_ids":enc_ids } error:&err];
     if (!enc->inputs) return free(enc), NULL;
 
     MLMultiArray *enc_embeds = array_init(embeds, @[ @77, @768 ], @[ @768, @1 ]);
     enc->options = [[MLPredictionOptions alloc] init];
-    [enc->options setOutputBackings:@{ @"last_hidden_state":enc_embeds }];
+    [enc->options setOutputBackings:@{ @"out_embeds":enc_embeds }];
     return enc;
 }
 
-static model_t *unet_init(MLModel *model,
+static model_t *diffuser_init(MLModel *model,
         float *embeds, float *step, float *latents, float *preds) {
-    model_t *unet = malloc(sizeof(model_t));
+    model_t *dif = malloc(sizeof(model_t));
     NSError *err = NULL;
-    unet->model = model ? model : load_model(@"unet", 0, &err);
-    if (!unet->model) return free(unet), NULL;
+    dif->model = model ? model : load_model(@"diffuser", 0, &err);
+    if (!dif->model) return free(dif), NULL;
 
     NSArray *shape = @[ @2, @4, @64, @64 ], *strides = @[ @16384, @4096, @64, @1 ];
-    MLMultiArray *u_embeds = array_init(embeds, @[ @2, @77, @768 ], @[ @59136, @768, @1 ]);
-    MLMultiArray *u_step = array_init(step, @[ @1 ], @[ @1 ]);
-    MLMultiArray *u_latents = array_init(latents, shape, strides);
-    unet->inputs = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"sample_1":u_latents, @"timestep":u_step, @"input_35":u_embeds } error:&err];
-    if (!unet->inputs) return free(unet), NULL;
+    MLMultiArray *dif_embeds = array_init(embeds, @[ @2, @77, @768 ], @[ @59136, @768, @1 ]);
+    MLMultiArray *dif_step = array_init(step, @[ @1 ], @[ @1 ]);
+    MLMultiArray *dif_latents = array_init(latents, shape, strides);
+    dif->inputs = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
+        @"in_latents":dif_latents, @"in_timestep":dif_step, @"in_embeds":dif_embeds} error:&err];
+    if (!dif->inputs) return free(dif), NULL;
 
-    MLMultiArray *u_preds = array_init(preds, shape, strides);
-    unet->options = [[MLPredictionOptions alloc] init];
-    [unet->options setOutputBackings:@{ @"var_5609":u_preds }];
-    return unet;
-}
-
-static model_t *quant_init(MLModel *model, float *preds, float *z) {
-    model_t *quant = malloc(sizeof(model_t));
-    NSError *err = NULL;
-    quant->model = model ? model : load_model(@"post_quant_conv", 0, &err);
-    if (!quant->model) return free(quant), NULL;
-
-    NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @4096, @4096, @64, @1 ];
-    MLMultiArray *quant_preds = array_init(preds, shape, strides);
-    quant->inputs = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"input":quant_preds } error:&err];
-    if (!quant->inputs) return free(quant), NULL;
-
-    MLMultiArray *quant_z = array_init(z, shape, strides);
-    quant->options = [[MLPredictionOptions alloc] init];
-    [quant->options setOutputBackings:@{ @"var_22":quant_preds }];
-    return quant;
+    MLMultiArray *dif_preds = array_init(preds, shape, strides);
+    dif->options = [[MLPredictionOptions alloc] init];
+    [dif->options setOutputBackings:@{ @"out_preds":dif_preds }];
+    return dif;
 }
 
 static model_t *decoder_init(MLModel *model, float *z, float *image) {
     model_t *dec = malloc(sizeof(model_t));
     NSError *err = NULL;
-    dec->model = model ? model : load_model(@"vae_decoder", 0, &err);
+    dec->model = model ? model : load_model(@"decoder", 0, &err);
     if (!dec->model) return free(dec), NULL;
 
     NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @4096, @4096, @64, @1 ];
     MLMultiArray *dec_z = array_init(z, shape, strides);
     dec->inputs = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"z":dec_z } error:&err];
+        initWithDictionary:@{ @"in_z":dec_z } error:&err];
     if (!dec->inputs) return free(dec), NULL;
 
     MLMultiArray *dec_image = array_init(image, @[ @3, @512, @512 ], @[ @262144, @512, @1 ]);
     dec->options = [[MLPredictionOptions alloc] init];
-    [dec->options setOutputBackings:@{ @"var_730":dec_image }];
+    [dec->options setOutputBackings:@{ @"out_image":dec_image }];
     return dec;
 }
 
 static int process_request(t2i_t engine, int req_id, model_t *enc,
-        model_t *unet, model_t *quant, model_t *dec, buffers_t data) {
+        model_t *dif, model_t *dec, buffers_t data) {
     t2i_handler_t handle = engine->handler;
     void *ctx = engine->context;
 
     /* Get encoder output embeddings */
     NSError *err = NULL;
     [enc->model predictionFromFeatures:enc->inputs options:enc->options error:&err];
-    if (err) return handle(ctx, req_id, T2I_ENCODER_FAILED);
+    if (err != NULL) {
+        NSLog(@"Encoder error: %@\n", [err localizedDescription]);
+        return handle(ctx, req_id, T2I_ENCODER_FAILED);
+    }
 
     NSLog(@"\nEncoder output:\n");
     int embeds_s[] = { 77 * 768, 768, 1 };
@@ -326,8 +300,11 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
         int latents_s[] = { 4 * 64 * 64, 64 * 64, 64, 1 };
         print_array(latents, latents_s, 0);
 
-        [unet->model predictionFromFeatures:unet->inputs options:unet->options error:&err];
-        if (err) return handle(ctx, req_id, T2I_UNET_FAILED);
+        [dif->model predictionFromFeatures:dif->inputs options:dif->options error:&err];
+        if (err != NULL) {
+            NSLog(@"UNet error: %@\n", [err localizedDescription]);
+            return handle(ctx, req_id, T2I_UNET_FAILED);
+        }
 
         /* Perform guidance */
         for (int i = 0; i < n_noise; ++i)
@@ -342,10 +319,11 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
             e_t[i] = 1.0 / 0.18215 * latents[i];
 
         /* Decode latents into image */
-        [quant->model predictionFromFeatures:quant->inputs options:quant->options error:&err];
-        if (err) return handle(ctx, req_id, T2I_UNET_FAILED);
         [dec->model predictionFromFeatures:dec->inputs options:dec->options error:&err];
-        if (err) return handle(ctx, req_id, T2I_UNET_FAILED);
+        if (err != NULL) {
+            NSLog(@"Decoder error: %@\n", [err localizedDescription]);
+            return handle(ctx, req_id, T2I_DECODER_FAILED);
+        }
 
         for (int i = 0; i < 512 * 512; ++i) {
             for (int j = 0; j < 3; ++j) {
@@ -384,24 +362,25 @@ static void *worker_main(void *args) {
 
     NSError *err = NULL;
     [uncond->model predictionFromFeatures:uncond->inputs options:uncond->options error:&err];
-    if (err) return handle(ctx, -1, T2I_ENCODER_FAILED), NULL;
+    if (err != NULL) {
+        NSLog(@"Encoder error: %@\n", [err localizedDescription]);
+        return handle(ctx, -1, T2I_ENCODER_FAILED), NULL;
+    }
 
-    /* Load unet model and buffers */
+    /* Load diffuser model and buffers */
     const int n_noise = 4 * 64 * 64;
     data.latents = calloc(2 * n_noise, sizeof(float));
     data.e_t = calloc(2 * n_noise, sizeof(float));
     data.step = 0.0f;
 
-    model_t *unet = unet_init(NULL, data.embeds, &data.step, data.latents, data.e_t);
-    if (!unet) return handle(ctx, -1, T2I_UNET_NOLOAD), NULL;
+    model_t *dif = diffuser_init(NULL, data.embeds, &data.step, data.latents, data.e_t);
+    if (!dif) return handle(ctx, -1, T2I_UNET_NOLOAD), NULL;
     if (handle(ctx, -1, T2I_UNET_LOADED)) return NULL;
 
     /* Load decoder model and buffers */
     data.image = calloc(3 * 512 * 512, sizeof(float));
     data.alphas = calloc(128, sizeof(float));
 
-    model_t *quant = quant_init(NULL, data.e_t, data.e_t + n_noise);
-    if (!quant) return handle(ctx, -1, T2I_DECODER_NOLOAD), NULL;
     model_t *dec = decoder_init(NULL, data.e_t + n_noise, data.image);
     if (!dec) return handle(ctx, -1, T2I_DECODER_NOLOAD), NULL;
     if (handle(ctx, -1, T2I_DECODER_LOADED)) return NULL;
@@ -411,7 +390,7 @@ static void *worker_main(void *args) {
         int req_id = queue_front(engine), err = 0;
         t2i_request_t *req = t2i_request(engine, req_id);
         bpe_encode(tokenizer, req->prompt, ids, 77);
-        process_request(engine, req_id, enc, unet, quant, dec, data);
+        process_request(engine, req_id, enc, dif, dec, data);
 
         /* Notify request finished */
         handle(ctx, req_id, T2I_FINISHED);

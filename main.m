@@ -152,12 +152,12 @@
   [runProgress setStyle:NSProgressIndicatorStyleSpinning];
   [runProgress setControlSize:NSControlSizeSmall];
   [runProgress setIndeterminate:NO];
-  [runProgress setDoubleValue:100];
+  [runProgress setDoubleValue:0];
   [self addSubview:runProgress];
 
   runStatus = [[Label alloc] initWithFrame:CGRectZero];
   [runStatus setTranslatesAutoresizingMaskIntoConstraints:NO];
-  [runStatus setStringValue:@"Finished"];
+  [runStatus setStringValue:@"Initializing"];
   [runStatus setTextColor:NSColor.secondaryLabelColor];
   [self addSubview:runStatus];
 
@@ -340,12 +340,24 @@ static int handler(void *ctx, int req_id, int status) {
   if (status == T2I_UNLOADED) {
     [rightPanel setRunStatus:@"Loading Encoder" progress:10];
   } else if (status == T2I_ENCODER_LOADED) {
-    [rightPanel setRunStatus:@"Loading UNet" progress:30];
+    [rightPanel setRunStatus:@"Loading Diffuser" progress:30];
+  } else if (status == T2I_ENCODER_NOLOAD) {
+    [rightPanel setRunStatus:@"Encoder Invalid" progress:100];
+  } else if (status == T2I_ENCODER_FAILED) {
+    [rightPanel setRunStatus:@"Encoding Failed" progress:100];
   } else if (status == T2I_UNET_LOADED) {
     [rightPanel setRunStatus:@"Loading Decoder" progress:80];
+  } else if (status == T2I_UNET_NOLOAD) {
+    [rightPanel setRunStatus:@"Diffuser Invalid" progress:100];
+  } else if (status == T2I_UNET_FAILED) {
+    [rightPanel setRunStatus:@"Inference Failed" progress:100];
   } else if (status == T2I_DECODER_LOADED) {
     [rightPanel setRunStatus:@"Loading finished" progress:100];
     [rightPanel setRunEnabled:YES];
+  } else if (status == T2I_DECODER_NOLOAD) {
+    [rightPanel setRunStatus:@"Decoder Invalid" progress:100];
+  } else if (status == T2I_DECODER_FAILED) {
+    [rightPanel setRunStatus:@"Decoding Failed" progress:100];
   } else if (status >= T2I_STEPS) {
     int steps = status - T2I_STEPS, total = t2i_request(engine, req_id)->steps;
     NSString *str = [NSString stringWithFormat:@"Running step %d / %d", steps, total];
