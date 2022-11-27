@@ -1,6 +1,10 @@
 # from https://gist.github.com/madebyollin/86b9596ffa4ab0fa7674a16ca2aeab3d
-import diffusers, os, shutil, subprocess
+# on converters/mil/front/torch.ops.py line 5096 add:
+# beta = mb.cast(x=beta, dtype="fp32")
+import os, sys, shutil, subprocess
+import diffusers, b2sdk.v2
 from diffusers import StableDiffusionPipeline
+
 import coremltools as ct
 import torch as th
 import numpy as np
@@ -20,11 +24,19 @@ class CLIPUndictifier(th.nn.Module):
     def forward(self, *args, **kwargs):
         return self.m(*args, **kwargs)[0]
 
+class QuantDecoder(th.nn.Module):
+    def __init__(self, q, d):
+        super().__init__()
+        self.q = q
+        self.d = d
+    def forward(self, inp):
+        tmp = self.q(inp)
+        return self.d(tmp)
+
 
 def compile_mlmodel(filename):
+    print(f"Compiling {filename} to models")
     subprocess.run(["xcrun", "coremlc", "compile", filename, "models"])
-    mlcname = filename.replace(".mlmodel", ".mlmodelc")
-    print(f"Compiled model to {mlcname}")
 
 
 def convert_text_encoder(text_encoder, out_name):
@@ -56,12 +68,10 @@ def convert_text_encoder(text_encoder, out_name):
 def convert_decoder(decoder, quant, out_name):
     print("Generating decoder model")
 
-    def combined(inputs):
-        temp = quant(inputs)
-        return decoder(temp)
+    # replace baddbmm beta with float
 
-    f_trace = th.jit.trace(combined,
-        (th.zeros(1, 4, 64, 64)), strict=False, check_trace=False)
+    f_trace = th.jit.trace(QuantDecoder(quant, decoder),
+        (th.zeros(1, 4, 64, 64, dtype=th.float32)), strict=False, check_trace=False)
     f_coreml = ct.convert(f_trace, 
         inputs=[ct.TensorType(shape=(1, 4, 64, 64))],
         convert_to="milinternal",
@@ -157,9 +167,9 @@ class TextEncoderWrapper:
             return (th.tensor(v, dtype=th.float32),)
 
 class DecoderWrapper:
-    def __init__(self, f, f2, out_name="decoder.mlpackage"):
+    def __init__(self, d, q, out_name="decoder.mlpackage"):
         if not os.path.exists(out_name):
-            convert_decoder(f, f2, out_name)
+            convert_decoder(d, q, out_name)
         print("Loading saved decoder model")
         compile_mlmodel(out_name)
         self.f = ct.models.MLModel(out_name, compute_units=ct.ComputeUnit.CPU_AND_GPU)
@@ -194,12 +204,24 @@ if __name__ == "__main__":
     pipe.vae = VAEWrapper(DecoderWrapper(pipe.vae.decoder, pipe.vae.post_quant_conv))
     pipe.safety_checker = lambda images, **kwargs: (images, False)
 
-    #generator = torch.Generator("cpu").manual_seed(123)
-    with open("noise.bin", "rb") as f:
-        data = np.fromfile(f, dtype=np.float32)
-    array = np.reshape(data, [1, 4, 64, 64])
-    loaded_noise = th.from_numpy(array)
+    # zip and upload models to b2
+    if len(sys.argv) > 1 and sys.argv[1] == "--upload":
+        zipname = "diffusionapp_models.zip"
+        os.remove(zipname)
+        subprocess.run(["zip", "-r", zipname, "models"])
+        sha1 = subprocess.check_output(["shasum", zipname], text=True).split()
+
+        b2_api = b2sdk.v2.B2Api(b2sdk.v2.InMemoryAccountInfo())
+        b2_api.authorize_account("production", os.getenv("B2_ACCOUNT_ID"), os.getenv("B2_ACCOUNT_KEY"))
+        bucket = b2_api.get_bucket_by_name("cqcumbers-public-b2")
+        bucket.upload_local_file(local_file=zipname, file_name=zipname, sha1_sum=sha1[0])
+
+    generator = th.Generator("cpu").manual_seed(123)
+    #with open("noise.bin", "rb") as f:
+    #    data = np.fromfile(f, dtype=np.float32)
+    #array = np.reshape(data, [1, 4, 64, 64])
+    #loaded_noise = th.from_numpy(array)
     prompt = "discovering ancient ruins, concept art by JaeCheol Park"
-    #image = pipe(prompt, num_inference_steps=21, generator=generator).images[0]
-    image = pipe(prompt, latents=loaded_noise, num_inference_steps=21).images[0]
+    image = pipe(prompt, num_inference_steps=21, generator=generator).images[0]
+    #image = pipe(prompt, latents=loaded_noise, num_inference_steps=21).images[0]
     image.save("ruins.png")

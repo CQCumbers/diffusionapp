@@ -10,6 +10,7 @@ ftfy = "*"
 scipy = "*"
 torch = "*"
 coremltools = "==6.1"
+b2sdk = "*"
 
 [dev-packages]
 
