@@ -1,9 +1,14 @@
-import os, sys, shutil, subprocess
-sys.path.insert(0, "ml_stable_diffusion")
-from python_coreml_stable_diffusion import torch2coreml
+import os, sys, types, shutil, functools
+import subprocess, b2sdk.v2, torch
 from diffusers import StableDiffusionPipeline
 from vocab import convert_vocab
-import b2sdk.v2
+
+sys.path.insert(0, "ml_stable_diffusion")
+from python_coreml_stable_diffusion import torch2coreml
+torch.jit.trace = functools.partial(
+    torch.jit.trace, strict=False, check_trace=False
+)
+
 
 if __name__ == "__main__":
     # clear models directory
@@ -12,11 +17,16 @@ if __name__ == "__main__":
     convert_vocab("models")
 
     # retrieve pytorch models from huggingface
-    pipe, args = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4",
-        use_auth_token=os.getenv("HUGGINGFACE_TOKEN")), {}
-    args.compute_unit = "ALL"
+    args = types.SimpleNamespace()
+    args.model_version = "CompVis/stable-diffusion-v1-4"
     args.attention_implementation = "SPLIT_EINSUM"
+    args.latent_w = 512
+    args.latent_h = 512
+    args.compute_unit = "ALL"
     args.o = "models"
+
+    pipe = StableDiffusionPipeline.from_pretrained(args.model_version,
+        revision="fp16", use_auth_token=os.getenv("HUGGINGFACE_TOKEN"))
 
     # convert models with ml-stable-diffusion
     print("Converting vae_decoder")
