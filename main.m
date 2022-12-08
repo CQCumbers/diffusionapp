@@ -234,7 +234,12 @@
 }
 
 - (void)fillRequest:(t2i_request_t*)req {
-  strncpy(req->prompt, [[promptBox stringValue] UTF8String], N_TOKENS);
+  NSString *prompt = [promptBox stringValue];
+  NSCharacterSet *set = [NSString whitespaceAndNewlineCharacterSet];
+  prompt = [prompt lowercaseString];
+  prompt = [prompt stringTrimmingCharactersInSet:set];
+
+  strncpy(req->prompt, [prompt UTF8String], N_TOKENS);
   req->strength = [strengthBox integerValue];
   req->steps = [stepsBox integerValue];
   req->guide = [guideBox integerValue];

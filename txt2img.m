@@ -103,6 +103,7 @@ static void gaussians_next(unsigned *s, float *out) {
     }
     r = sqrtf(-2 * logf(r) / r);
     out[0] = u * r, out[1] = v * r;
+    printf("%f\n%f\n", out[0], out[1]);
 }
 
 /* === Engine interface === */
@@ -203,17 +204,17 @@ typedef struct {
 static model_t *encoder_init(MLModel *model, float *ids, float *embeds) {
     model_t *enc = malloc(sizeof(model_t));
     NSError *err = NULL;
-    enc->model = model ? model : load_model(@"txt_encoder", 0, &err);
+    enc->model = model ? model : load_model(@"text_encoder", 0, &err);
     if (!enc->model) return free(enc), NULL;
 
     MLMultiArray *enc_ids = array_init(ids, @[ @1, @77 ], @[ @77, @1 ]);
     enc->inputs = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"in_ids":enc_ids } error:&err];
+        initWithDictionary:@{ @"input_ids":enc_ids } error:&err];
     if (!enc->inputs) return free(enc), NULL;
 
     MLMultiArray *enc_embeds = array_init(embeds, @[ @77, @768 ], @[ @768, @1 ]);
     enc->options = [[MLPredictionOptions alloc] init];
-    [enc->options setOutputBackings:@{ @"out_embeds":enc_embeds }];
+    [enc->options setOutputBackings:@{ @"last_hidden_state":enc_embeds }];
     return enc;
 }
 
@@ -221,7 +222,7 @@ static model_t *diffuser_init(MLModel *model,
         float *embeds, float *step, float *latents, float *preds) {
     model_t *dif = malloc(sizeof(model_t));
     NSError *err = NULL;
-    dif->model = model ? model : load_model(@"diffuser", 0, &err);
+    dif->model = model ? model : load_model(@"unet", 0, &err);
     if (!dif->model) return free(dif), NULL;
 
     NSArray *shape = @[ @2, @4, @64, @64 ], *strides = @[ @16384, @4096, @64, @1 ];
@@ -229,30 +230,30 @@ static model_t *diffuser_init(MLModel *model,
     MLMultiArray *dif_step = array_init(step, @[ @1 ], @[ @1 ]);
     MLMultiArray *dif_latents = array_init(latents, shape, strides);
     dif->inputs = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
-        @"in_latents":dif_latents, @"in_timestep":dif_step, @"in_embeds":dif_embeds} error:&err];
+        @"sample":dif_latents, @"timestep":dif_step, @"encoder_hidden_states":dif_embeds} error:&err];
     if (!dif->inputs) return free(dif), NULL;
 
     MLMultiArray *dif_preds = array_init(preds, shape, strides);
     dif->options = [[MLPredictionOptions alloc] init];
-    [dif->options setOutputBackings:@{ @"out_preds":dif_preds }];
+    [dif->options setOutputBackings:@{ @"noise_pred":dif_preds }];
     return dif;
 }
 
 static model_t *decoder_init(MLModel *model, float *z, float *image) {
     model_t *dec = malloc(sizeof(model_t));
     NSError *err = NULL;
-    dec->model = model ? model : load_model(@"decoder", 0, &err);
+    dec->model = model ? model : load_model(@"vae_decoder", 0, &err);
     if (!dec->model) return free(dec), NULL;
 
     NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @4096, @4096, @64, @1 ];
     MLMultiArray *dec_z = array_init(z, shape, strides);
     dec->inputs = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"in_z":dec_z } error:&err];
+        initWithDictionary:@{ @"z":dec_z } error:&err];
     if (!dec->inputs) return free(dec), NULL;
 
     MLMultiArray *dec_image = array_init(image, @[ @3, @512, @512 ], @[ @262144, @512, @1 ]);
     dec->options = [[MLPredictionOptions alloc] init];
-    [dec->options setOutputBackings:@{ @"out_image":dec_image }];
+    [dec->options setOutputBackings:@{ @"image":dec_image }];
     return dec;
 }
 
@@ -284,6 +285,10 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
     xoshiro_seed(data.rng, req->seed);
     for (int i = 0; i < n_noise; i += 2)
         gaussians_next(data.rng, &latents[i]);
+
+    FILE *dump = fopen("noise.bin", "w+");
+    fwrite(latents, sizeof(float), n_noise, dump);
+    fclose(dump);
 
     const int max_filename = 128;
     char filename[max_filename];

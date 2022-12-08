@@ -135,14 +135,14 @@ void bpe_free(bpe_context_t ctx) {
     munmap(ctx, sizeof(struct BpeContext));
 }
 
-int bpe_encode(bpe_context_t ctx, const char *text, float *ids, int capacity) {
+int bpe_encode(bpe_context_t ctx, char *text, float *ids, int capacity) {
     /* initialize token list */
     token_t *list = ctx->list;
     short length = strlen(text), n_ids = 0;
     if (length >= N_TOKENS) return printf("Too much text%d\n", length), 0;
     for (short i = 0; i < length; ++i)
         list[i] = (token_t){ i - 1, i + 1, i, i + 1 };
-    if (length) list[length - 1].next = -1;
+    if (length) list[length - 1].next = -1, text[length] = ' ';
 
     /* initialize merge agenda */
     unsigned n_agenda = 0;
