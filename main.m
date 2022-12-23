@@ -235,9 +235,9 @@
 
 - (void)fillRequest:(t2i_request_t*)req {
   NSString *prompt = [promptBox stringValue];
-  NSCharacterSet *set = [NSString whitespaceAndNewlineCharacterSet];
+  NSCharacterSet *set = [NSCharacterSet whitespaceAndNewlineCharacterSet];
   prompt = [prompt lowercaseString];
-  prompt = [prompt stringTrimmingCharactersInSet:set];
+  prompt = [prompt stringByTrimmingCharactersInSet:set];
 
   strncpy(req->prompt, [prompt UTF8String], N_TOKENS);
   req->strength = [strengthBox integerValue];
