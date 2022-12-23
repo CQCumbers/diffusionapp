@@ -15,7 +15,7 @@ static MLModel *load_model(NSString *name, int cpuOnly, NSError **err) {
     NSLog(@"Loading %@ from mlmodelc\n", name);
     NSURL *url = [[NSBundle mainBundle] URLForResource:name withExtension:@"mlmodelc"];
     MLModelConfiguration *config = [[MLModelConfiguration alloc] init];
-    config.computeUnits = cpuOnly ? MLComputeUnitsCPUOnly : MLComputeUnitsCPUAndGPU;
+    config.computeUnits = cpuOnly ? MLComputeUnitsCPUOnly : MLComputeUnitsAll;
     return [MLModel modelWithContentsOfURL:url configuration:config error:err];
 }
 
@@ -27,45 +27,79 @@ static MLMultiArray *array_init(float *data, NSArray *shape, NSArray *strides) {
     return array;
 }
 
-static void print_array(float *array, int *strides, int indent) {
+static void print_array(const float *array, const int *strides, int indent) {
     /* pretty print an MLMultiArray */
     int inner = strides[1] == 1, dot_i = inner ? 0 : indent + 2;
     char sep = inner ? ' ' : '\n';
     printf("%*s[%c", indent, "", sep);
     for (int i = 0, len = strides[0] / strides[1]; i < len; ++i) {
         if (i >= 3 && i < len - 3) printf("%*s...%c", dot_i, "", sep), i = len - 3;
-        float *elem = array + i * strides[1];
+        const float *elem = array + i * strides[1];
         if (inner) printf("%f ", *elem);
         else print_array(elem, strides + 1, indent + 2);
     }
     printf("%*s]\n", inner ? 0 : indent, "");
 }
 
-/* === DDIM? scheduler === */
+static void print_stats(const float *array, int size) {
+    float mean = 0, mean2 = 0;
+    for (int i = 0; i < size; ++i) {
+        mean = mean + (array[i] - mean) / (i + 1);
+        mean2 = mean2 + (array[i] * array[i] - mean2) / (i + 1);
+    }
+    printf("mean: %f stddev %f\n", mean, mean2 - mean * mean);
+}
+
+/* === PNDM scheduler === */
 
 static void sched_init(float *alphas, float start, float end, int steps) {
     float beta_start = sqrtf(start);
-    float beta_step = (sqrtf(end) - beta_start) / 1000;
-    float alpha = 1.0 - start, beta = beta_start;
-    for (int step = 0; step < steps; ++step) {
+    float beta_step = (sqrtf(end) - beta_start) / (1000 - 1);
+    float alpha = 1.0 - start;
+    alphas[steps] = alpha;
+    for (int step = steps, n = 0; step-- > 0;) {
         for (int i = 0; i < 1000 / steps; ++i) {
-            if (i == 1) alphas[step + 1] = alpha;
-            beta += beta_step, alpha *= 1.0 - beta * beta;
+            if (i == 1) alphas[step] = alpha;
+            float beta = beta_start + beta_step * ++n;
+            alpha *= (float)(1.0 - beta * beta);
         }
     }
-    alphas[0] = 1.0;
 }
 
-static void sched_step(const float *alphas, int i,
-        const float *noise, float *latents, int size) {
-    float alpha_t = alphas[i + 1], alpha_p = alphas[i];
-    float sqrt_at = sqrtf(alpha_t), sqrt_ap = sqrtf(alpha_p);
-    float sqrt_1at = sqrtf(1.0 - alpha_t);
-    float sqrt_1ap = sqrtf(1.0 - alpha_p);
+static void sched_step(const float *alphas, int step,
+        const float *e_t, float *latents, int size) {
+    int idx = step ? step - 1 : step; // 0-1 use same alphas
+    float a_t = alphas[idx + 0], b_t = 1.0 - a_t;
+    float a_p = alphas[idx + 1], b_p = 1.0 - a_p;
 
+    float l_coeff = sqrtf(a_p / a_t);
+    float n_denom = a_t * sqrtf(b_p) + sqrtf(a_t * b_t * a_p);
+    float n_coeff = (a_p - a_t) / n_denom;
+
+    const float weights[5][4] = {
+        { 1.0 }, { 0.5, 0.5 }, { 1.5, -0.5 },
+        { 23/12.0, -16/12.0, 5/12.0 },
+        { 55/24.0, -59/24.0, 37/24.0, -9/24.0 }
+    };
+
+    int w_idx = step < 4 ? step : 4;
+    const float *n[4], *w = weights[w_idx];
+    for (int t = 0; t < 4; ++t)
+        n[t] = e_t + (step + 4 - t) % 4 * size;
+
+    printf("alphas %.8f %.8f coeffs %.8f %.8f\n", a_t, a_p, l_coeff, n_coeff);
     for (int i = 0; i < size; ++i) {
-        float pred_x0 = latents[i] - sqrt_1at * noise[i];
-        latents[i] = (pred_x0 / sqrt_at) * sqrt_ap + sqrt_1ap * noise[i];
+        float avg = w[0] * n[0][i] + w[1] * n[1][i];
+        avg += w[2] * n[2][i] + w[3] * n[3][i];
+        latents[i] = l_coeff * latents[i] - n_coeff * avg;
+    }
+}
+
+static void transpose_embeds(const float *embeds, float *hidden) {
+    for (int i = 0; i < 77; ++i) {
+        for (int j = 0; j < 768; ++j) {
+            hidden[j * 77 + i] = embeds[i * 768 + j];
+        }
     }
 }
 
@@ -103,7 +137,6 @@ static void gaussians_next(unsigned *s, float *out) {
     }
     r = sqrtf(-2 * logf(r) / r);
     out[0] = u * r, out[1] = v * r;
-    printf("%f\n%f\n", out[0], out[1]);
 }
 
 /* === Engine interface === */
@@ -193,12 +226,14 @@ typedef struct {
 
 typedef struct {
     float *embeds;
+    float *hidden;
     float *latents;
+    float *step;
+    float *out;
     float *e_t;
     float *image;
     float *alphas;
     unsigned rng[4];
-    float step;
 } buffers_t;
 
 static model_t *encoder_init(MLModel *model, float *ids, float *embeds) {
@@ -219,18 +254,18 @@ static model_t *encoder_init(MLModel *model, float *ids, float *embeds) {
 }
 
 static model_t *diffuser_init(MLModel *model,
-        float *embeds, float *step, float *latents, float *preds) {
+        float *hidden, float *step, float *latents, float *preds) {
     model_t *dif = malloc(sizeof(model_t));
     NSError *err = NULL;
     dif->model = model ? model : load_model(@"unet", 0, &err);
     if (!dif->model) return free(dif), NULL;
 
     NSArray *shape = @[ @2, @4, @64, @64 ], *strides = @[ @16384, @4096, @64, @1 ];
-    MLMultiArray *dif_embeds = array_init(embeds, @[ @2, @77, @768 ], @[ @59136, @768, @1 ]);
-    MLMultiArray *dif_step = array_init(step, @[ @1 ], @[ @1 ]);
+    MLMultiArray *dif_hidden = array_init(hidden, @[ @2, @768, @1, @77 ], @[ @59136, @77, @77, @1 ]);
+    MLMultiArray *dif_step = array_init(step, @[ @2 ], @[ @1 ]);
     MLMultiArray *dif_latents = array_init(latents, shape, strides);
     dif->inputs = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
-        @"sample":dif_latents, @"timestep":dif_step, @"encoder_hidden_states":dif_embeds} error:&err];
+        @"sample":dif_latents, @"timestep":dif_step, @"encoder_hidden_states":dif_hidden} error:&err];
     if (!dif->inputs) return free(dif), NULL;
 
     MLMultiArray *dif_preds = array_init(preds, shape, strides);
@@ -245,7 +280,7 @@ static model_t *decoder_init(MLModel *model, float *z, float *image) {
     dec->model = model ? model : load_model(@"vae_decoder", 0, &err);
     if (!dec->model) return free(dec), NULL;
 
-    NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @4096, @4096, @64, @1 ];
+    NSArray *shape = @[ @1, @4, @64, @64 ], *strides = @[ @16384, @4096, @64, @1 ];
     MLMultiArray *dec_z = array_init(z, shape, strides);
     dec->inputs = [[MLDictionaryFeatureProvider alloc]
         initWithDictionary:@{ @"z":dec_z } error:&err];
@@ -272,38 +307,31 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
 
     NSLog(@"\nEncoder output:\n");
     int embeds_s[] = { 77 * 768, 768, 1 };
-    print_array(data.embeds + 77 * 768, embeds_s, 0);
+    print_array(data.embeds, embeds_s, 0);
+    transpose_embeds(data.embeds, data.hidden + 768 * 77);
 
-    /* Setup scheudler alphas */
+    /* Setup scheduler alphas */
     t2i_request_t *req = t2i_request(engine, req_id);
     if (req->steps > 127) req->steps = 127;
+    data.step[0] = data.step[1] = 1001 - 1000 % req->steps;
     sched_init(data.alphas, 0.00085, 0.0120, req->steps);
 
     /* Generate latent noise vector */
     const int n_noise = 4 * 64 * 64;
-    float *latents = data.latents, *e_t = data.e_t;
+    float *latents = data.latents, *out = data.out;
     xoshiro_seed(data.rng, req->seed);
     for (int i = 0; i < n_noise; i += 2)
-        gaussians_next(data.rng, &latents[i]);
-
-    FILE *dump = fopen("noise.bin", "w+");
-    fwrite(latents, sizeof(float), n_noise, dump);
-    fclose(dump);
+        gaussians_next(data.rng, latents + i);
 
     const int max_filename = 128;
     char filename[max_filename];
     float guidance = req->guide / 10.0f;
-    for (int i = 0; i < req->steps; ++i, data.step -= 1000 / req->steps) {
+    for (int step = 0; step <= req->steps; ++step) {
         /* run UNet to predict noise residual */
-        NSLog(@"Running step %d: %f\n", i, data.step);
-        if (handle(ctx, req_id, T2I_STEPS + i)) return 1;
+        if (step != 2) data.step[0] = data.step[1] -= 1000 / req->steps;
+        NSLog(@"Running step %d: %f\n", step, data.step[0]);
+        if (handle(ctx, req_id, T2I_STEPS + step)) return 1;
         memcpy(latents + n_noise, latents, n_noise * sizeof(float));
-
-        NSLog(@"\nUNet Input:\n");
-        print_array(data.embeds, embeds_s, 0);
-        NSLog(@"\nLatent values:\n");
-        int latents_s[] = { 4 * 64 * 64, 64 * 64, 64, 1 };
-        print_array(latents, latents_s, 0);
 
         [dif->model predictionFromFeatures:dif->inputs options:dif->options error:&err];
         if (err != NULL) {
@@ -312,16 +340,14 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
         }
 
         /* Perform guidance */
+        float *e_t = data.e_t + step % 4 * n_noise;
         for (int i = 0; i < n_noise; ++i)
-            e_t[i] += guidance * (e_t[n_noise + i] - e_t[i]);
-
-        NSLog(@"\ne_t values:\n");
-        print_array((float*)e_t, latents_s, 0);
+            e_t[i] = out[i] + guidance * (out[n_noise + i] - out[i]);
 
         /* Compute previous noisy sample */
-        sched_step(data.alphas, i, e_t, latents, n_noise);
+        sched_step(data.alphas, step, data.e_t, latents, n_noise);
         for (int i = 0; i < n_noise; ++i)
-            e_t[i] = 1.0 / 0.18215 * latents[i];
+            out[i] = latents[i] / 0.18215;
 
         /* Decode latents into image */
         [dec->model predictionFromFeatures:dec->inputs options:dec->options error:&err];
@@ -332,11 +358,11 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
 
         for (int i = 0; i < 512 * 512; ++i) {
             for (int j = 0; j < 3; ++j) {
-                float pixel = data.image[j * 512 * 512 + i];
+                float pixel = fmin(fmax(data.image[j * 512 * 512 + i], -1), 1);
                 req->image[i * 3 + j] = (unsigned char)(pixel * 127 + 128);
             }
         }
-        snprintf(filename, max_filename, "step_%d.png", i);
+        snprintf(filename, max_filename, "step_%d.png", step);
         stbi_write_png(filename, 512, 512, 3, req->image, 512 * 3);
     }
 
@@ -359,15 +385,13 @@ static void *worker_main(void *args) {
 
     /* Load encoder model and buffers */
     NSArray *shape, *strides;
-    data.embeds = calloc(2 * 77 * 768, sizeof(float));
-    model_t *enc = encoder_init(NULL, ids, data.embeds + 77 * 768);
+    data.embeds = calloc(77 * 768, sizeof(float));
+    model_t *enc = encoder_init(NULL, ids, data.embeds);
     if (!enc) return handle(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
-    model_t *uncond = encoder_init(enc->model, ids, data.embeds);
-    if (!uncond) return handle(ctx, -1, T2I_ENCODER_NOLOAD), NULL;
     if (handle(ctx, -1, T2I_ENCODER_LOADED)) return NULL;
 
     NSError *err = NULL;
-    [uncond->model predictionFromFeatures:uncond->inputs options:uncond->options error:&err];
+    [enc->model predictionFromFeatures:enc->inputs options:enc->options error:&err];
     if (err != NULL) {
         NSLog(@"Encoder error: %@\n", [err localizedDescription]);
         return handle(ctx, -1, T2I_ENCODER_FAILED), NULL;
@@ -375,19 +399,22 @@ static void *worker_main(void *args) {
 
     /* Load diffuser model and buffers */
     const int n_noise = 4 * 64 * 64;
+    data.hidden = calloc(2 * 768 * 77, sizeof(float));
     data.latents = calloc(2 * n_noise, sizeof(float));
-    data.e_t = calloc(2 * n_noise, sizeof(float));
-    data.step = 0.0f;
+    data.step = calloc(2, sizeof(float));
+    data.out = calloc(2 * n_noise, sizeof(float));
 
-    model_t *dif = diffuser_init(NULL, data.embeds, &data.step, data.latents, data.e_t);
+    model_t *dif = diffuser_init(NULL, data.hidden, data.step, data.latents, data.out);
     if (!dif) return handle(ctx, -1, T2I_UNET_NOLOAD), NULL;
     if (handle(ctx, -1, T2I_UNET_LOADED)) return NULL;
+    transpose_embeds(data.embeds, data.hidden);
 
     /* Load decoder model and buffers */
     data.image = calloc(3 * 512 * 512, sizeof(float));
     data.alphas = calloc(128, sizeof(float));
+    data.e_t = calloc(4 * n_noise, sizeof(float));
 
-    model_t *dec = decoder_init(NULL, data.e_t + n_noise, data.image);
+    model_t *dec = decoder_init(NULL, data.out, data.image);
     if (!dec) return handle(ctx, -1, T2I_DECODER_NOLOAD), NULL;
     if (handle(ctx, -1, T2I_DECODER_LOADED)) return NULL;
 
