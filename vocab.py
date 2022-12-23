@@ -3,7 +3,7 @@ import requests
 
 N_SLOTS = 65536
 N_TOKENS = 4096
-slot = struct.Struct("@IIi")
+fmt = struct.Struct("@IIi")
 
 def hash_string(string):
     value = 2166136261
@@ -18,17 +18,19 @@ def hash_mix(lhs, rhs):
     return lhs & 0xFFFFFFFF
 
 def hash_add(buffer, key, value):
-    offset, dist = key % N_SLOTS, 1
+    idx, item = key, [1, key, value]
     while True:
-        item = slot.unpack_from(buffer, offset * slot.size)
-        if item[1] == key: return False
-        slot.pack_into(buffer, offset * slot.size, dist, key, value)
-        if item[0] == 0: return True
-        if item[0] < dist: dist, key, value = item
-        offset, dist = (offset + 1) % N_SLOTS, dist + 1
+        offset = (idx % N_SLOTS) * fmt.size
+        slot = list(fmt.unpack_from(buffer, offset))
+        if slot[0] < item[0] or slot[0] == 0:
+            fmt.pack_into(buffer, offset, *item)
+            if slot[0] == 0: return True
+            slot, item = item, slot
+        if slot[1] == item[1]: return False
+        idx, item[0] = idx + 1, item[0] + 1
 
 def read_rules(file):
-    rules = bytearray(slot.size * N_SLOTS)
+    rules = bytearray(fmt.size * N_SLOTS)
     for i, line in enumerate(file):
         if line.startswith(b"#"): continue
         lhs, rhs = line.decode("utf-8").split()
@@ -38,7 +40,7 @@ def read_rules(file):
     return rules
 
 def read_vocab(file):
-    vocab, bos, eos = bytearray(slot.size * N_SLOTS), 0, 0
+    vocab, bos, eos = bytearray(fmt.size * N_SLOTS), 0, 0
     for token, i in json.load(file).items():
         token = token.replace("</w>", " ")
         if token == "<|startoftext|>": bos = i

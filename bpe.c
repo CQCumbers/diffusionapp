@@ -140,9 +140,10 @@ int bpe_encode(bpe_context_t ctx, char *text, float *ids, int capacity) {
     token_t *list = ctx->list;
     short length = strlen(text), n_ids = 0;
     if (length >= N_TOKENS) return printf("Too much text%d\n", length), 0;
+    if (length) text[length++] = ' ';
     for (short i = 0; i < length; ++i)
         list[i] = (token_t){ i - 1, i + 1, i, i + 1 };
-    if (length) list[length - 1].next = -1, text[length] = ' ';
+    list[length - 1].next = -1;
 
     /* initialize merge agenda */
     unsigned n_agenda = 0;
@@ -184,6 +185,12 @@ int bpe_encode(bpe_context_t ctx, char *text, float *ids, int capacity) {
         }
     }
 
+    for (int i = 0; i < length; ++i) {
+        if (list[i].byte_l == -1) continue;
+        printf("%.*s ", list[i].byte_r - list[i].byte_l, text + list[i].byte_l);
+    }
+    printf("\n");
+
     /* convert merged tokens to ids */
     ids[n_ids] = ctx->bos_id;
     for (int i = 0; i < length; ++i) {
@@ -196,5 +203,6 @@ int bpe_encode(bpe_context_t ctx, char *text, float *ids, int capacity) {
 
     for (int i = n_ids + 1; i < capacity; ++i)
         ids[i] = ctx->eos_id;
+    if (length) text[--length] = '\0';
     return n_ids + 1;
 }
