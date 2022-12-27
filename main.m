@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "txt2img.h"
 
 @interface IntegerFormatter : NSNumberFormatter
@@ -208,6 +209,7 @@
   [saveButton setTranslatesAutoresizingMaskIntoConstraints:NO];
   [saveButton setTitle:@"Save Image"];
   [saveButton setBezelStyle:NSBezelStyleRounded];
+  [saveButton setEnabled:NO];
   [saveButton setAction:@selector(saveImage:)];
   [self addSubview:saveButton];
 
@@ -249,6 +251,8 @@
 - (void)setRunStatus:(NSString*)string progress:(double)progress {
   [runStatus setStringValue:string];
   [runProgress setDoubleValue:progress];
+  BOOL finished = [string isEqual:@"Inference Finished"];
+  [saveButton setEnabled:finished];
 }
 
 - (void)setRunEnabled:(BOOL)enabled {
@@ -367,6 +371,7 @@ static int handler(void *ctx, int req_id, int status) {
     int steps = status - T2I_STEPS, total = t2i_request(engine, req_id)->steps;
     NSString *str = [NSString stringWithFormat:@"Running step %d / %d", steps, total];
     [rightPanel setRunStatus:str progress:steps * 100 / total];
+    [imageView setImage:[self createImage:t2i_request(engine, req_id)->image]];
   } else if (status == T2I_FINISHED) {
     [rightPanel setRunStatus:@"Inference Finished" progress:100];
   }
@@ -386,12 +391,25 @@ static int handler(void *ctx, int req_id, int status) {
   /* Submit inference request */
   [rightPanel fillRequest:t2i_request(engine, req_id)];
   t2i_submit(engine, submit_id = req_id);
-  [imageView setImage:[self createImage:t2i_request(engine, submit_id)->image]];
+  [imageView setImage:[self createImage:t2i_request(engine, req_id)->image]];
   [rightPanel setRunStatus:@"Starting Inference" progress:0];
 }
 
 - (IBAction)saveImage:(id)sender {
   NSSavePanel* panel = [NSSavePanel savePanel];
+  [panel setAllowedContentTypes:@[ UTTypeJPEG, UTTypePNG ]];
+  t2i_request_t *req = t2i_request(engine, submit_id);
+
+  NSString *filename = [NSString stringWithUTF8String:req->prompt];
+  filename = [filename stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+  filename = [NSString stringWithFormat:@"%@.%d.png", filename, req->seed];
+  [panel setNameFieldStringValue:filename];
+
+  [panel beginSheetModalForWindow:self completionHandler:^(NSModalResponse result){
+    if (result == NSModalResponseCancel) return;
+    const char *path = [[[panel URL] path] UTF8String];
+    img_write(req->image, 512, 512, path);
+  }];
 }
 @end
 

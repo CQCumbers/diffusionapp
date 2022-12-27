@@ -33,3 +33,4 @@ void t2i_free(t2i_t engine);
 t2i_request_t *t2i_request(t2i_t engine, int req_id);
 int t2i_acquire(t2i_t engine);
 void t2i_submit(t2i_t engine, int req_id);
+int img_write(const char *img, int w, int h, const char *path);

@@ -20,7 +20,8 @@ file(GLOB_RECURSE RESOURCES "models/*")
 add_executable(diffusionapp MACOSX_BUNDLE main.m txt2img.m bpe.c ${RESOURCES})
 target_compile_options(diffusionapp PRIVATE -g "-fsanitize=address")
 target_link_libraries(diffusionapp PRIVATE "-framework Cocoa"
-    "-framework CoreML" "-framework Foundation" "-fsanitize=address")
+    "-framework CoreML" "-framework Foundation"
+    "-framework UniformTypeIdentifiers" "-fsanitize=address")
 
 # Set resource paths
 foreach (FILE ${RESOURCES})

@@ -50,6 +50,15 @@ static void print_stats(const float *array, int size) {
     printf("mean: %f stddev %f\n", mean, mean2 - mean * mean);
 }
 
+int img_write(const char *img, int w, int h, const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!strcmp(ext, ".png"))
+        return stbi_write_png(path, w, h, 3, img, w * 3);
+    if (!strcmp(ext, ".jpg") || !strcmp(ext, ".jpeg"))
+        return stbi_write_jpg(path, w, h, 3, img, 95);
+    return printf("unrecognized extension: %s\n", ext), 0;
+}
+
 /* === PNDM scheduler === */
 
 static void sched_init(float *alphas, float start, float end, int steps) {
@@ -327,7 +336,7 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
     char filename[max_filename];
     float guidance = req->guide / 10.0f;
     for (int step = 0; step <= req->steps; ++step) {
-        /* run UNet to predict noise residual */
+        /* Run UNet to predict noise residual */
         if (step != 2) data.step[0] = data.step[1] -= 1000 / req->steps;
         NSLog(@"Running step %d: %f\n", step, data.step[0]);
         if (handle(ctx, req_id, T2I_STEPS + step)) return 1;
@@ -356,14 +365,13 @@ static int process_request(t2i_t engine, int req_id, model_t *enc,
             return handle(ctx, req_id, T2I_DECODER_FAILED);
         }
 
+        /* Clamp and convert to 8-bit */
         for (int i = 0; i < 512 * 512; ++i) {
             for (int j = 0; j < 3; ++j) {
                 float pixel = fmin(fmax(data.image[j * 512 * 512 + i], -1), 1);
-                req->image[i * 3 + j] = (unsigned char)(pixel * 127 + 128);
+                req->image[i * 3 + j] = (char)(pixel * 127 + 128);
             }
         }
-        snprintf(filename, max_filename, "step_%d.png", step);
-        stbi_write_png(filename, 512, 512, 3, req->image, 512 * 3);
     }
 
     NSLog(@"Successfully finished processing");
